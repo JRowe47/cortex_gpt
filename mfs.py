@@ -96,3 +96,63 @@ class MultiFacetSoftmax(nn.Module):
             logp = logp.squeeze(1)
 
         return (logp, loss, aux) if targets is not None else (logp, aux)
+
+
+class MFSHead(nn.Module):
+    """Compatibility wrapper around :class:`MultiFacetSoftmax`.
+
+    The original project referenced an ``MFSHead`` class which is no longer
+    present.  Some modules still import ``MFSHead`` from ``mfs`` and expect an
+    interface that accepts a ``slate`` conditioning vector and returns
+    log‑probabilities when requested.  This light wrapper delegates to
+    :class:`MultiFacetSoftmax` and ignores extra arguments so that legacy code
+    continues to run.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        vocab_size: int,
+        K: int = 7,
+        P: int = 1,
+        slate_dim: int = 0,
+        low_rank_r: int = 0,
+        tie_weight: nn.Embedding | None = None,
+    ):
+        super().__init__()
+        # ``P``, ``slate_dim`` and ``low_rank_r`` are accepted for backwards
+        # compatibility but are not used by this simplified wrapper.
+        self.mfs = MultiFacetSoftmax(
+            d_model,
+            vocab_size,
+            num_facets=K,
+        )
+        if tie_weight is not None:
+            weight = (
+                tie_weight.weight if isinstance(tie_weight, nn.Embedding) else tie_weight
+            )
+            for f in self.mfs.facets:
+                f.weight = weight
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        slate: torch.Tensor | None = None,
+        temperature: float = 1.0,
+        return_logprobs: bool = False,
+    ):
+        # Temporarily override the temperature of the wrapped head.
+        prev_temp = self.mfs.temperature
+        self.mfs.temperature = temperature
+        logp, _ = self.mfs(h)
+        self.mfs.temperature = prev_temp
+
+        if return_logprobs:
+            return logp
+        else:
+            return logp.exp()
+
+
+# Allow importing with either ``MFSHead`` or ``MFShead`` (historic casing).
+MFShead = MFSHead
+
