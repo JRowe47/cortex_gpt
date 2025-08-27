@@ -5,6 +5,9 @@ import torch.nn.functional as F
 
 from model import GPT, GPTConfig  # uses your Fe‑RoPE + MFS + AE model :contentReference[oaicite:1]{index=1}
 from htm_meta import apply_column_multipliers, ColumnMetaController  # meta hook (LR/WD scaling) :contentReference[oaicite:2]{index=2}
+from cortex.hexgrid import make_grid, build_adjacency
+from cortex.cortex_model import CortexModel
+from cortex.io_patches import TextSensor
 
 # -----------------------
 # Data utilities (char)
@@ -59,6 +62,36 @@ def bpc_from_nll(nll):
 
 def ppl_from_nll(nll):
     return math.exp(nll)
+
+
+def build_cortex_and_inputs(vocab_size: int,
+                            d_model: int = 384,
+                            regions_w: int = 17,
+                            regions_h: int = 18,
+                            k_active: int = 6,
+                            num_facets: int = 7,
+                            top_m_facets: int = 2,
+                            router_top_k: int = 4,
+                            device: str = "cuda"):
+    hexes = make_grid(regions_w, regions_h)
+    adj = build_adjacency(hexes, long_range_per_node=2)
+    neighbor_indices = [adj[i] for i in range(len(hexes))]
+    R = len(hexes)
+    io_idxs = {'sensor': 0, 'motor': R - 1}
+
+    model = CortexModel(R=R,
+                        d_model=d_model,
+                        neighbor_indices=neighbor_indices,
+                        io_idxs=io_idxs,
+                        vocab_size=vocab_size,
+                        num_facets=num_facets,
+                        top_m_facets=top_m_facets,
+                        k_active=k_active,
+                        n_slots=8,
+                        router_top_k=router_top_k).to(device)
+
+    sensor = TextSensor(vocab_size=vocab_size, d_model=d_model, ctx_len=128, tie_embedding=True).to(device)
+    return model, sensor, neighbor_indices, io_idxs
 
 # -----------------------
 # Main
@@ -178,6 +211,16 @@ def main():
 
         x, y = get_batch(train_enc, args.block, args.batch, device)
         opt.zero_grad(set_to_none=True)
+
+        # Suppose your batch provides: tokens [B, T] and targets [B, T]
+        # Build once:
+        # model, sensor, neighbor_indices, io_idxs = build_cortex_and_inputs(V, args.emb, 17, 18, 6, 7, 2, 4, device)
+        #
+        # For each step:
+        # x_emb, tied = sensor(tokens)          # [B, T, D]; use last step or a pooling as region input
+        # x_per_region = torch.zeros(len(neighbor_indices), tokens.size(0), model.d_model, device=device)
+        # x_per_region[io_idxs['sensor']] = x_emb[:, -1, :]  # Example: feed last-token embedding into sensor region
+        # logp, loss, aux = model(x_per_region, targets=targets[:, -1])
 
         # forward: combined loss (LM + scaled AE)
         logits, total_loss = model(x, targets=y)
