@@ -94,8 +94,14 @@ def get_batch_bytes(split_data: torch.Tensor, batch_size: int, block_size: int, 
     B = batch_size
     T = block_size
     assert T >= 2, "block_size must be >= 2"
-    # We use T-1 for context, and the final position as the candidate token.
-    ix = torch.randint(low=0, high=len(split_data) - T - 1, size=(B,), device=device)
+    # We use T-1 for context and require enough data to sample a full window.
+    max_start = len(split_data) - T + 1  # inclusive range of valid start positions
+    if max_start <= 0:
+        raise ValueError(
+            f"split_data length {len(split_data)} is insufficient for block_size {T}."
+            " Reduce block_size or provide more data."
+        )
+    ix = torch.randint(low=0, high=max_start, size=(B,), device=device)
     ctx = torch.stack([split_data[i:i + (T - 1)] for i in ix], dim=0)  # [B, T-1]
     y_true = torch.stack([split_data[i + (T - 1)] for i in ix], dim=0)  # [B]
 
@@ -402,8 +408,14 @@ def train_ff(args):
         if args.eval_interval > 0 and step % args.eval_interval == 0:
             model.eval()
             with torch.no_grad():
-                vpos, vneg = get_batch_bytes(val_data, args.batch_size, args.block_size, device,
-                                             posneg_negatives=1)
+                val_block_size = min(args.block_size, len(val_data))
+                vpos, vneg = get_batch_bytes(
+                    val_data,
+                    args.batch_size,
+                    val_block_size,
+                    device,
+                    posneg_negatives=1,
+                )
                 vpos_in = snapshot_block_inputs(model, vpos, blocks)[-1]  # last block input (not used further)
                 vneg_in = snapshot_block_inputs(model, vneg[:, 0, :], blocks)[-1]
                 # run last block only to estimate goodness gap quickly
