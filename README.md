@@ -9,6 +9,18 @@
 
 The fork remains drop‑in compatible with nanoGPT training. You can flip features on/off via config flags.
 
+## Installation & Setup
+
+This repo targets **Python 3.10+** and **PyTorch 2.0+**. A minimal setup:
+
+```bash
+git clone https://github.com/yourname/cortex_gpt.git  # replace with your fork
+cd cortex_gpt
+pip install torch numpy tiktoken
+```
+
+`tiktoken` is only needed for the sampling helper; the core model depends mainly on PyTorch and NumPy.
+
 ---
 
 ## Big picture: columns → regions → geometric routing
@@ -130,8 +142,9 @@ GPTConfig(
 
 ## Quickstart
 
-* **Smoke test** (sanity): run the included script; you should see probability sums ≈ 1 (after softmax), a finite train loss step, and working generation. The test exercises both **MFS** and fallback head paths.&#x20;
-* **Training**: use your standard nanoGPT loop; the model returns `(logits, loss)` and handles CE/NLL automatically based on the MFS head’s output convention.&#x20;
+* **Smoke test** (sanity): `python smoke_test.py --device=cpu` runs a tiny model end‑to‑end and prints probability sums ≈ 1 after softmax, a finite train loss, and generation output. The test exercises both **MFS** and fallback head paths.&#x20;
+* **Training**: `python train.py --batch_size=32 --compile=False` mirrors the nanoGPT training loop; the model returns `(logits, loss)` and handles CE/NLL automatically based on the MFS head’s output convention.&#x20;
+* **Sampling**: once checkpoints exist in `out/`, `python sample.py --out_dir=out --num_samples=5` produces sample completions.&#x20;
 
 ---
 
