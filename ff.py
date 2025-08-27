@@ -50,8 +50,10 @@ class KWTA(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         topk_vals, topk_idx = x.topk(self.k, dim=-1)
         mask = torch.zeros_like(x).scatter(-1, topk_idx, 1.0)
-        # update duty cycle
-        self.duty.mul_(1 - self.alpha).add_(self.alpha * mask.mean(dim=0, keepdim=True))
+        # update duty cycle across all non-feature dimensions
+        reduce_dims = tuple(range(mask.dim() - 1))
+        duty_mean = mask.mean(dim=reduce_dims).unsqueeze(0)
+        self.duty.mul_(1 - self.alpha).add_(self.alpha * duty_mean)
         boost = torch.exp(-self.gamma * (self.duty - self.target))
         x = x * boost
         return x * mask
