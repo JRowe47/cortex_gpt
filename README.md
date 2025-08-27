@@ -1,4 +1,4 @@
-# nanoGPT‑FE‑RoPE: Cortical columns + geometric routing + MFS head
+# cortex-gpt [nanoGPT‑FE‑RoPE: Cortical columns + geometric routing + MFS head]
 
 **Purpose.** This repo explores how to give a tiny GPT a **biologically‑inspired communication structure**—cortical columns grouped into regions with sparse, distance‑aware routing—while keeping the familiar GPT training loop. Concretely, it adds:
 
