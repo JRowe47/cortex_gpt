@@ -408,8 +408,14 @@ def train_ff(args):
         if args.eval_interval > 0 and step % args.eval_interval == 0:
             model.eval()
             with torch.no_grad():
-                vpos, vneg = get_batch_bytes(val_data, args.batch_size, args.block_size, device,
-                                             posneg_negatives=1)
+                val_block_size = min(args.block_size, len(val_data))
+                vpos, vneg = get_batch_bytes(
+                    val_data,
+                    args.batch_size,
+                    val_block_size,
+                    device,
+                    posneg_negatives=1,
+                )
                 vpos_in = snapshot_block_inputs(model, vpos, blocks)[-1]  # last block input (not used further)
                 vneg_in = snapshot_block_inputs(model, vneg[:, 0, :], blocks)[-1]
                 # run last block only to estimate goodness gap quickly
