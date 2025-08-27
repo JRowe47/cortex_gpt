@@ -3,7 +3,8 @@ import os, math, time, argparse
 import torch
 import torch.nn.functional as F
 
-from model import GPT, GPTConfig  # uses your Fe‑RoPE + MFS + AE model :contentReference[oaicite:1]{index=1}
+from model import GPT, GPTConfig
+from ff import ff_loss, anomaly_scale, UnionSDR  # uses your Fe‑RoPE + MFS + AE model :contentReference[oaicite:1]{index=1}
 from htm_meta import apply_column_multipliers, ColumnMetaController  # meta hook (LR/WD scaling) :contentReference[oaicite:2]{index=2}
 from cortex.hexgrid import make_grid, build_adjacency
 from cortex.cortex_model import CortexModel
@@ -151,6 +152,7 @@ def main():
     cfg = GPTConfig(
         block_size=args.block, vocab_size=V,
         n_layer=args.layers, n_head=args.heads, n_embd=args.emb,
+        kwta_frac=0.03, use_dendrites=True, ff_mode="sumsq",
         dropout=0.0, bias=True,
 
         # Fe‑RoPE + PDS sparsity (geometric routing) 
@@ -197,6 +199,8 @@ def main():
     best_val = float("inf")
     best_path = os.path.join(args.outdir, "best.pt")
 
+    union = UnionSDR(V)
+
     # ---- train ----
     model.train()
     log_every = 50
@@ -210,6 +214,19 @@ def main():
         model._l4_loss_weight = base_aux_w * warm_frac
 
         x, y = get_batch(train_enc, args.block, args.batch, device)
+        y_neg = torch.randint_like(y, 0, V)
+        acts = model.forward_acts(x)
+        emb_pos = model.transformer.wte(y)
+        emb_neg = model.transformer.wte(y_neg)
+        ff_losses = []
+        g_pos_last = g_neg_last = None
+        for i, h in acts.items():
+            h_last = h[:, -1, :]
+            g_pos = model.transformer.h[i].ff_head.goodness(h_last + emb_pos[:, -1, :])
+            g_neg = model.transformer.h[i].ff_head.goodness(h_last + emb_neg[:, -1, :])
+            ff_losses.append(ff_loss(g_pos, g_neg))
+            g_pos_last, g_neg_last = g_pos, g_neg
+        ff_total = torch.stack(ff_losses).sum()
         opt.zero_grad(set_to_none=True)
 
         # Suppose your batch provides: tokens [B, T] and targets [B, T]
@@ -224,6 +241,12 @@ def main():
 
         # forward: combined loss (LM + scaled AE)
         logits, total_loss = model(x, targets=y)
+        total_loss = total_loss + ff_total
+
+        # union update for multi-hypothesis tracking
+        topk = logits[:, -1, :].topk(5, dim=-1).indices
+        mask = torch.zeros_like(logits[:, -1, :]).scatter(-1, topk, 1.0)
+        union.update(mask)
 
         # LM-only NLL (from MFS log-probs) for clear tracking
         V = logits.size(-1)
@@ -249,7 +272,12 @@ def main():
                 )
                 if args.meta_log and (step % log_every == 0):
                     print(f"[meta] step {step} p_true={p_true:.4e} ratio={ratio:.2f} s_norm={s_norm:.3f}")
-
+        anomaly = float((g_neg_last - g_pos_last).detach().abs().mean())
+        cur_lr = sched.get_last_lr()[0]
+        new_lr, new_beta2 = anomaly_scale(anomaly, cur_lr, opt.param_groups[0]['betas'][1])
+        for pg in opt.param_groups:
+            pg['lr'] = new_lr
+            pg['betas'] = (pg['betas'][0], new_beta2)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         opt.step()
         sched.step()
