@@ -24,6 +24,7 @@ from sparse_routing import allowed_anchor_pairs
 
 # Heads (already in your repo)
 from mfs import MFSHead
+from ff import FFHead, KWTA, DendriteGate
 from sliding_window_ae import SlidingWindowAE
 
 
@@ -210,7 +211,7 @@ class CausalSelfAttention(nn.Module):
     def set_router(self, router: Optional['RegionRouter']):
         self._router_ctx = router
 
-    def forward(self, x):
+    def forward(self, x, ctx=None):
         B, T, C = x.size()
 
         # project to QKV and reshape
@@ -287,7 +288,7 @@ class MLP(nn.Module):
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
+    def forward(self, x, ctx=None):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
@@ -319,6 +320,10 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        kwta_frac = float(getattr(config, "kwta_frac", 0.0))
+        self.kwta = KWTA(config.n_embd, int(config.n_embd * kwta_frac)) if kwta_frac > 0 else None
+        self.dgate = DendriteGate(config.n_embd, config.n_embd, m=int(getattr(config, "dendrite_segments", 4))) if getattr(config, "use_dendrites", False) else None
+        self.ff_head = FFHead(config.n_embd, mode=getattr(config, "ff_mode", "sumsq"))
         # NEW: optional region feedback head
         self.use_region_feedback = bool(getattr(config, "use_region_feedback", False))
         self.fb_hops = int(getattr(config, "feedback_hops", 1))
@@ -330,12 +335,17 @@ class Block(nn.Module):
         self._router_ctx = router
         self.attn.set_router(router)
 
-    def forward(self, x):
+    def forward(self, x, ctx=None):
         x = x + self.attn(self.ln_1(x))
         # NEW: feedback residual based on shared router, if enabled
         if self.fb is not None and self._router_ctx is not None:
             x = self.fb(x, self._router_ctx, hops=self.fb_hops)
-        x = x + self.mlp(self.ln_2(x))
+        h = self.mlp(self.ln_2(x))
+        if self.dgate is not None:
+            h = self.dgate(h, ctx if ctx is not None else x)
+        if self.kwta is not None:
+            h = self.kwta(h)
+        x = x + h
         return x
 
 
@@ -352,6 +362,10 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2.
+    kwta_frac: float = 0.0
+    use_dendrites: bool = False
+    dendrite_segments: int = 4
+    ff_mode: str = "sumsq"
 
     # Fe‑RoPE + PDS
     ferope_anchor_relative: bool = True
@@ -461,6 +475,33 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    def forward_acts(self, idx):
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        router = None
+        want_router = bool(getattr(self.config, "share_region_router", False) or getattr(self.config, "use_block_sparse", False))
+        if want_router:
+            try:
+                router = RegionRouter(T=t, device=device,
+                                     anchor_min_gap=getattr(self.config, "anchor_min_gap", 256),
+                                     anchor_jitter=getattr(self.config, "anchor_jitter", 32),
+                                     neighbor_rings=int(getattr(self.config, "neighbor_rings", 1)))
+            except NameError:
+                router = None
+        acts = {}
+        for i, block in enumerate(self.transformer.h):
+            if router is not None and hasattr(block, "set_router"):
+                block.set_router(router)
+            x = block(x, ctx=x)
+            acts[i] = x
+        return acts
+
+
     # ----------------------------
     # Slate (local and regional) for MFS facets (cheap)
     # ----------------------------
@@ -547,7 +588,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if router is not None and hasattr(block, "set_router"):
                 block.set_router(router)
-            x = block(x)
+            x = block(x, ctx=x)
 
         x = self.transformer.ln_f(x)             # final hidden [B,T,D]
 
