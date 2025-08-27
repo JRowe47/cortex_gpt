@@ -94,8 +94,14 @@ def get_batch_bytes(split_data: torch.Tensor, batch_size: int, block_size: int, 
     B = batch_size
     T = block_size
     assert T >= 2, "block_size must be >= 2"
-    # We use T-1 for context, and the final position as the candidate token.
-    ix = torch.randint(low=0, high=len(split_data) - T - 1, size=(B,), device=device)
+    # We use T-1 for context and require enough data to sample a full window.
+    max_start = len(split_data) - T + 1  # inclusive range of valid start positions
+    if max_start <= 0:
+        raise ValueError(
+            f"split_data length {len(split_data)} is insufficient for block_size {T}."
+            " Reduce block_size or provide more data."
+        )
+    ix = torch.randint(low=0, high=max_start, size=(B,), device=device)
     ctx = torch.stack([split_data[i:i + (T - 1)] for i in ix], dim=0)  # [B, T-1]
     y_true = torch.stack([split_data[i + (T - 1)] for i in ix], dim=0)  # [B]
 
