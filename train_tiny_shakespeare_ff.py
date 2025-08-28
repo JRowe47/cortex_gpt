@@ -462,9 +462,18 @@ def train_ff(args):
         total_loss_this_step = 0.0
         head_ce = 0.0
         g_pos = g_neg = g_noise_gauss = g_noise_pure = None  # last block metrics
+        layer_pos_means = []
+        layer_neg_means = []
+        layer_noise_means = []
+        layer_grad_norms = []
+
         for li, blk in enumerate(blocks):
             opt = opts[li]
             if opt is None:
+                layer_pos_means.append(float("nan"))
+                layer_neg_means.append(float("nan"))
+                layer_noise_means.append(float("nan"))
+                layer_grad_norms.append(0.0)
                 continue
             opt.zero_grad(set_to_none=True)
 
@@ -516,10 +525,25 @@ def train_ff(args):
                     loss_l = ff_binary_loss(g_pos, y_lbl, theta=args.theta)
 
             loss_l.backward()
-            # Optional grad clip per block
+            # Optional grad clip per block and capture grad norm for debugging
             if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(blk.parameters(), grad_clip)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(blk.parameters(), grad_clip))
+            else:
+                grad_norm = math.sqrt(
+                    sum(
+                        (p.grad.detach().pow(2).sum().item())
+                        for p in blk.parameters()
+                        if p.grad is not None
+                    )
+                )
             opt.step()
+
+            layer_pos_means.append(float(g_pos.mean()))
+            layer_neg_means.append(float(g_neg.mean()) if g_neg is not None else float("nan"))
+            layer_noise_means.append(
+                float(g_noise_pure.mean()) if g_noise_pure is not None else float("nan")
+            )
+            layer_grad_norms.append(grad_norm)
 
             total_loss_this_step += float(loss_l.detach())
 
@@ -530,11 +554,11 @@ def train_ff(args):
                 final_in = snapshot_block_inputs(model, pos_seq, blocks)[-1]
                 final_h = blocks[-1](final_in)
             if hasattr(model, "lm_head_mfs"):
-                head_logits = model.lm_head_mfs(final_h)
+                head_logp = model.lm_head_mfs(final_h, return_logprobs=True)
             else:
-                head_logits = model.lm_head(final_h)
+                head_logp = model.lm_head(final_h).log_softmax(dim=-1)
             target = pos_seq[:, -1]
-            ce_loss = F.cross_entropy(head_logits[:, -1, :], target)
+            ce_loss = F.nll_loss(head_logp[:, -1, :], target)
             ce_loss.backward()
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(head_params, grad_clip)
@@ -576,6 +600,16 @@ def train_ff(args):
                 f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise_seq {ema_noise_g:.3f}  "
                 f"({dt:.1f}s)"
             )
+            print(
+                "    layer_pos "
+                + str([round(v, 3) for v in layer_pos_means])
+                + " layer_neg "
+                + str([round(v, 3) for v in layer_neg_means])
+                + " layer_noise "
+                + str([round(v, 3) for v in layer_noise_means])
+                + " grad_norms "
+                + str([round(v, 3) for v in layer_grad_norms])
+            )
 
         # Evaluation: goodness probe + LM metrics for parity with backprop run
         if args.eval_interval > 0 and step % args.eval_interval == 0:
@@ -605,16 +639,22 @@ def train_ff(args):
                     device,
                     posneg_negatives=1,
                 )
-                vpos_in = snapshot_block_inputs(model, vpos, blocks)[-1]
-                vneg_in = snapshot_block_inputs(model, vneg[:, 0, :], blocks)[-1]
-                v_g_pos = (
-                    layer_goodness(blocks[-1](vpos_in), token_index=-1).mean().item()
-                )
-                v_g_neg = (
-                    layer_goodness(blocks[-1](vneg_in), token_index=-1).mean().item()
+                vpos_inputs = snapshot_block_inputs(model, vpos, blocks)
+                vneg_inputs = snapshot_block_inputs(model, vneg[:, 0, :], blocks)
+                per_block = []
+                for li, blk in enumerate(blocks):
+                    vp = layer_goodness(blk(vpos_inputs[li]), token_index=-1).mean().item()
+                    vn = layer_goodness(blk(vneg_inputs[li]), token_index=-1).mean().item()
+                    per_block.append((vp, vn))
+                last_pos, last_neg = per_block[-1]
+                print(
+                    "[val probe] goodness per-block pos/neg: "
+                    + " ".join(
+                        f"{i}:{p:.2f}/{n:.2f}" for i, (p, n) in enumerate(per_block)
+                    )
                 )
                 print(
-                    f"[val probe] goodness last-block: pos {v_g_pos:.3f}  neg {v_g_neg:.3f}  gap {v_g_pos - v_g_neg:.3f}"
+                    f"[val probe] last-block gap: pos {last_pos:.3f}  neg {last_neg:.3f}  gap {last_pos - last_neg:.3f}"
                 )
             model.train()
 
