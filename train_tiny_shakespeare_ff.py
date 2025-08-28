@@ -378,12 +378,18 @@ def train_ff(args):
     last_log = time.time()
     ema_pos_g = None
     ema_neg_g = None
+    ema_noise_g = None
 
     for step in range(1, args.steps + 1):
         # --- Build a minibatch of positive and negative sequences ---
-        pos_seq, neg_seq = get_batch_bytes(train_data, args.batch_size, args.block_size, device,
-                                           posneg_negatives=args.negatives)
-        # --- Capture *inputs* to each block for pos/neg via one forward pass each ---
+        pos_seq, neg_seq = get_batch_bytes(
+            train_data, args.batch_size, args.block_size, device,
+            posneg_negatives=args.negatives)
+
+        # Extra pure noise batch for monitoring collapse
+        noise_seq = torch.randint(0, 256, pos_seq.shape, device=device)
+
+        # --- Capture *inputs* to each block for pos/neg/noise via one forward pass each ---
         with torch.no_grad():
             pos_inputs_per_block = snapshot_block_inputs(model, pos_seq, blocks)
             if neg_seq is not None:
@@ -391,6 +397,7 @@ def train_ff(args):
                 neg_inputs_per_block = snapshot_block_inputs(model, neg_seq[:, 0, :], blocks)
             else:
                 neg_inputs_per_block = None
+            noise_inputs_per_block = snapshot_block_inputs(model, noise_seq, blocks)
 
         # --- Per-layer local FF update ---
         total_loss_this_step = 0.0
@@ -405,13 +412,20 @@ def train_ff(args):
             y_pos = blk(x_pos_in)
             g_pos = layer_goodness(y_pos, token_index=-1)   # [B]
 
+            x_noise_in = noise_inputs_per_block[li].detach()
+            y_noise = blk(x_noise_in)
+            g_noise = layer_goodness(y_noise, token_index=-1)  # [B]
+
             if neg_inputs_per_block is not None:
                 x_neg_in = neg_inputs_per_block[li].detach().requires_grad_(True)
                 y_neg = blk(x_neg_in)
                 g_neg = layer_goodness(y_neg, token_index=-1)  # [B]
 
                 # Build labels: +1 for pos, -1 for neg, concat
-                y_lbl = torch.cat([torch.ones_like(g_pos), -torch.ones_like(g_neg)], dim=0)  # [2B]
+                y_lbl = torch.cat([
+                    torch.ones_like(g_pos),
+                    -torch.ones_like(g_neg)
+                ], dim=0)  # [2B]
                 g_all = torch.cat([g_pos, g_neg], dim=0)  # [2B]
                 loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
             else:
@@ -431,18 +445,29 @@ def train_ff(args):
         with torch.no_grad():
             mean_pos = float(g_pos.mean()) if 'g_pos' in locals() else float('nan')
             mean_neg = float(g_neg.mean()) if 'g_neg' in locals() else float('nan')
+            mean_noise = float(g_noise.mean()) if 'g_noise' in locals() else float('nan')
             ema_pos_g = mean_pos if ema_pos_g is None else 0.98 * ema_pos_g + 0.02 * mean_pos
             ema_neg_g = mean_neg if ema_neg_g is None else 0.98 * ema_neg_g + 0.02 * mean_neg
+            ema_noise_g = mean_noise if ema_noise_g is None else 0.98 * ema_noise_g + 0.02 * mean_noise
+
+            # Head cross-entropy on the positive batch for monitoring
+            ctx = pos_seq[:, :-1]
+            y_true = pos_seq[:, -1]
+            logits, _ = model(ctx, targets=None)
+            head_ce = F.nll_loss(logits[:, -1, :], y_true, reduction='mean').item()
 
         global_step += 1
         if step % args.log_interval == 0 or step == 1:
             dt = time.time() - last_log
             last_log = time.time()
-            print(f"step {step:6d}/{args.steps}  "
-                  f"ff_loss {total_loss_this_step:.4f}  "
-                  f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  "
-                  f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  "
-                  f"({dt:.1f}s)")
+            print(
+                f"step {step:6d}/{args.steps}  "
+                f"ff_loss {total_loss_this_step:.4f}  "
+                f"head_ce {head_ce:.4f}  "
+                f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  "
+                f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise {ema_noise_g:.3f}  "
+                f"({dt:.1f}s)"
+            )
 
         # Evaluation: goodness probe + LM metrics for parity with backprop run
         if args.eval_interval > 0 and step % args.eval_interval == 0:
