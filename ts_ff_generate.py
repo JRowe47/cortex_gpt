@@ -31,10 +31,14 @@ def main():
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--cpu", action="store_true")
+    p.add_argument("--cpu", action="store_true", help="force CPU even if CUDA is available")
     args = p.parse_args()
 
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    use_cpu = getattr(args, "cpu", False)
+    if not use_cpu and not torch.cuda.is_available():
+        print("WARNING: CUDA is not available, falling back to CPU")
+        use_cpu = True
+    device = torch.device("cuda" if not use_cpu else "cpu")
     torch.manual_seed(args.seed)
 
     model = load_model(args.ckpt, device)
