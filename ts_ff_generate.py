@@ -4,7 +4,9 @@ from model import GPT, GPTConfig
 
 
 def load_model(ckpt_path: str, device: torch.device) -> GPT:
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # Use weights_only=True for safer loading; the checkpoint contains only tensors
+    # and simple Python types, so this is compatible with the restricted loader
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     config = ckpt.get("config") or ckpt.get("model_args")
     if config is None:
         raise ValueError("Checkpoint is missing model config")
@@ -17,7 +19,8 @@ def load_model(ckpt_path: str, device: torch.device) -> GPT:
 
 
 def decode_bytes(tokens) -> str:
-    return bytes(tokens).decode("utf-8", errors="replace")
+    """Decode a list of byte tokens into UTF-8 text, ignoring malformed bytes."""
+    return bytes(tokens).decode("utf-8", errors="ignore")
 
 
 def main():
@@ -42,8 +45,9 @@ def main():
     with torch.no_grad():
         out = model.generate(idx, args.max_new_tokens, temperature=args.temperature, top_k=args.top_k)
 
-    generated = out[0, idx.size(1):].tolist()
-    text = decode_bytes(generated)
+    # `out` already contains the prompt followed by generated tokens.
+    # Decode the full sequence so the printed text begins with the prompt.
+    text = decode_bytes(out[0].tolist())
     print(text)
 
 
