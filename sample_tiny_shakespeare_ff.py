@@ -1,4 +1,5 @@
 import os
+import argparse
 import pickle
 import torch
 
@@ -55,8 +56,20 @@ def make_encode_decode(stoi, itos, vocab_size_from_model: int):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Generate text from FF Tiny Shakespeare model")
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default=os.path.join(os.path.dirname(__file__), "out_ff", "ff_final.pt"),
+        help="path to ff_final.pt checkpoint",
+    )
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt_path = os.path.join(os.path.dirname(__file__), "ff_final.pt")
+    ckpt_path = args.ckpt
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+
     checkpoint = torch.load(ckpt_path, map_location="cpu")
     model_args = checkpoint.get("model_args", checkpoint.get("config", {}))
     gpt_conf = GPTConfig(**model_args)
@@ -67,6 +80,8 @@ def main():
 
     stoi, itos = load_tokenizer(ckpt_path)
     encode, decode = make_encode_decode(stoi, itos, gpt_conf.vocab_size)
+    test_str = "Round trip OK"
+    assert decode(encode(test_str)) == test_str
 
     prompt = "The thing about gooses is "
     input_ids = torch.tensor([encode(prompt)], dtype=torch.long, device=device)
