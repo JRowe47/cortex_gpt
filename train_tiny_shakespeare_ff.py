@@ -83,6 +83,42 @@ def load_bytes_dataset(data_dir: str) -> Tuple[torch.Tensor, torch.Tensor]:
     return train_data, val_data
 
 
+@torch.no_grad()
+def eval_lm(model: nn.Module,
+            data: torch.Tensor,
+            block_size: int,
+            batch_size: int,
+            steps: int,
+            device: torch.device) -> float:
+    """Simple LM NLL evaluation on a byte dataset."""
+    model.eval()
+    tot = 0.0
+    cnt = 0
+    for _ in range(steps):
+        max_start = len(data) - block_size - 1
+        if max_start <= 0:
+            raise ValueError(
+                f"data length {len(data)} insufficient for block_size {block_size}"
+            )
+        ix = torch.randint(0, max_start, (batch_size,), device=device)
+        x = torch.stack([data[i:i + block_size] for i in ix], dim=0)
+        y = torch.stack([data[i + 1:i + block_size + 1] for i in ix], dim=0)
+        logits, _ = model(x, targets=None)
+        V = logits.size(-1)
+        nll = F.nll_loss(logits.view(-1, V), y.view(-1), ignore_index=-1, reduction='mean')
+        tot += float(nll)
+        cnt += 1
+    return tot / max(1, cnt)
+
+
+def bpc_from_nll(nll: float) -> float:
+    return nll / math.log(2.0)
+
+
+def ppl_from_nll(nll: float) -> float:
+    return math.exp(nll)
+
+
 def get_batch_bytes(split_data: torch.Tensor, batch_size: int, block_size: int, device: torch.device,
                     posneg_negatives: int = 1):
     """
@@ -404,10 +440,18 @@ def train_ff(args):
                   f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  "
                   f"({dt:.1f}s)")
 
-        # Lightweight val probe (optional): compare goodness gap on val split
+        # Evaluation: goodness probe + LM metrics for parity with backprop run
         if args.eval_interval > 0 and step % args.eval_interval == 0:
             model.eval()
             with torch.no_grad():
+                # LM NLL / bpc / ppl
+                val_lm = eval_lm(model, val_data, args.block_size, args.batch_size,
+                                 steps=args.eval_batches, device=device)
+                bpc = bpc_from_nll(val_lm)
+                ppl = ppl_from_nll(val_lm)
+                print(f"[eval] step {step:6d}  val_lm_nll {val_lm:.4f}  bpc {bpc:.3f}  ppl {ppl:.2f}")
+
+                # Optional goodness gap on val split
                 val_block_size = min(args.block_size, len(val_data))
                 vpos, vneg = get_batch_bytes(
                     val_data,
@@ -416,9 +460,8 @@ def train_ff(args):
                     device,
                     posneg_negatives=1,
                 )
-                vpos_in = snapshot_block_inputs(model, vpos, blocks)[-1]  # last block input (not used further)
+                vpos_in = snapshot_block_inputs(model, vpos, blocks)[-1]
                 vneg_in = snapshot_block_inputs(model, vneg[:, 0, :], blocks)[-1]
-                # run last block only to estimate goodness gap quickly
                 v_g_pos = layer_goodness(blocks[-1](vpos_in), token_index=-1).mean().item()
                 v_g_neg = layer_goodness(blocks[-1](vneg_in), token_index=-1).mean().item()
                 print(f"[val probe] goodness last-block: pos {v_g_pos:.3f}  neg {v_g_neg:.3f}  gap {v_g_pos - v_g_neg:.3f}")
@@ -440,8 +483,19 @@ def train_ff(args):
     # Final save
     os.makedirs(args.out_dir, exist_ok=True)
     final_path = os.path.join(args.out_dir, "ff_final.pt")
-    torch.save({"model": model.state_dict(), "config": gpt_conf.__dict__ if hasattr(gpt_conf, '__dict__') else dict(gpt_conf)}, final_path)
+    torch.save({
+        "model": model.state_dict(),
+        "config": gpt_conf.__dict__ if hasattr(gpt_conf, '__dict__') else dict(gpt_conf),
+    }, final_path)
     print(f"Saved final model to {final_path}")
+
+    # Quick sample for sanity, using standard autoregressive generation
+    model.eval()
+    ctx = torch.randint(0, 256, (1, min(64, args.block_size)), device=device)
+    out = model.generate(ctx, max_new_tokens=200, temperature=1.0, top_k=50)
+    sample = bytes(out[0].tolist()).decode('utf-8', errors='ignore')
+    print("\n=== Sample ===")
+    print(sample)
 
 
 # ---------------------------
@@ -502,6 +556,7 @@ def parse_args():
     p.add_argument("--out_dir", type=str, default="out_ff", help="where to save checkpoints")
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--eval_interval", type=int, default=200, help="val goodness probe interval (0=off)")
+    p.add_argument("--eval_batches", type=int, default=20, help="batches for LM eval at each probe")
     p.add_argument("--ckpt_interval", type=int, default=0, help="checkpoint interval in steps (0=off)")
     p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=64)
