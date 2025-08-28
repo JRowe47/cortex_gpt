@@ -443,7 +443,10 @@ def train_ff(args):
             device,
             posneg_negatives=args.negatives,
         )
-        # --- Capture *inputs* to each block for pos/neg via one forward pass each ---
+        # Extra pure noise batch for monitoring collapse
+        noise_seq = torch.randint(0, 256, pos_seq.shape, device=device)
+
+        # --- Capture *inputs* to each block for pos/neg/noise via one forward pass each ---
         with torch.no_grad():
             pos_inputs_per_block = snapshot_block_inputs(model, pos_seq, blocks)
             if neg_seq is not None:
@@ -453,11 +456,12 @@ def train_ff(args):
                 )
             else:
                 neg_inputs_per_block = None
+            noise_inputs_per_block = snapshot_block_inputs(model, noise_seq, blocks)
 
         # --- Per-layer local FF update ---
         total_loss_this_step = 0.0
         head_ce = 0.0
-        g_pos = g_neg = g_noise = None  # last block metrics
+        g_pos = g_neg = g_noise_gauss = g_noise_pure = None  # last block metrics
         for li, blk in enumerate(blocks):
             opt = opts[li]
             if opt is None:
@@ -473,9 +477,14 @@ def train_ff(args):
             if args.noise_std > 0:
                 act_std = y_pos.std().detach()
                 noise = torch.randn_like(y_pos) * act_std * args.noise_std
-                g_noise = layer_goodness(y_pos + noise, token_index=-1)  # [B]
+                g_noise_gauss = layer_goodness(y_pos + noise, token_index=-1)  # [B]
             else:
-                g_noise = None
+                g_noise_gauss = None
+
+            # Pure noise sequence for collapse monitoring
+            x_noise_in = noise_inputs_per_block[li].detach()
+            y_noise = blk(x_noise_in)
+            g_noise_pure = layer_goodness(y_noise, token_index=-1)  # [B]
 
             if neg_inputs_per_block is not None:
                 x_neg_in = neg_inputs_per_block[li].detach().requires_grad_(True)
@@ -487,18 +496,19 @@ def train_ff(args):
                 labels = [torch.ones_like(g_pos)]
                 parts.append(g_neg)
                 labels.append(-torch.ones_like(g_neg))
-                if g_noise is not None:
-                    parts.append(g_noise)
-                    labels.append(-torch.ones_like(g_noise))
+                if g_noise_gauss is not None:
+                    parts.append(g_noise_gauss)
+                    labels.append(-torch.ones_like(g_noise_gauss))
                 g_all = torch.cat(parts, dim=0)
                 y_lbl = torch.cat(labels, dim=0)
                 loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
             else:
                 # Positive-only regularization toward a target goodness (rarely used)
-                if g_noise is not None:
-                    g_all = torch.cat([g_pos, g_noise], dim=0)
+                if g_noise_gauss is not None:
+                    g_all = torch.cat([g_pos, g_noise_gauss], dim=0)
                     y_lbl = torch.cat(
-                        [torch.ones_like(g_pos), -torch.ones_like(g_noise)], dim=0
+                        [torch.ones_like(g_pos), -torch.ones_like(g_noise_gauss)],
+                        dim=0,
                     )
                     loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
                 else:
@@ -536,7 +546,12 @@ def train_ff(args):
         with torch.no_grad():
             mean_pos = float(g_pos.mean()) if g_pos is not None else float("nan")
             mean_neg = float(g_neg.mean()) if g_neg is not None else float("nan")
-            mean_noise = float(g_noise.mean()) if g_noise is not None else float("nan")
+            mean_noise = (
+                float(g_noise_gauss.mean()) if g_noise_gauss is not None else float("nan")
+            )
+            mean_noise_seq = (
+                float(g_noise_pure.mean()) if g_noise_pure is not None else float("nan")
+            )
             ema_pos_g = (
                 mean_pos if ema_pos_g is None else 0.98 * ema_pos_g + 0.02 * mean_pos
             )
@@ -544,9 +559,9 @@ def train_ff(args):
                 mean_neg if ema_neg_g is None else 0.98 * ema_neg_g + 0.02 * mean_neg
             )
             ema_noise_g = (
-                mean_noise
+                mean_noise_seq
                 if ema_noise_g is None
-                else 0.98 * ema_noise_g + 0.02 * mean_noise
+                else 0.98 * ema_noise_g + 0.02 * mean_noise_seq
             )
 
         global_step += 1
@@ -557,8 +572,8 @@ def train_ff(args):
                 f"step {step:6d}/{args.steps}  "
                 f"ff_loss {total_loss_this_step:.4f}  "
                 f"head_ce {head_ce:.4f}  "
-                f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  "
-                f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise {ema_noise_g:.3f}  "
+                f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  g_noise_seq {mean_noise_seq:.3f}  "
+                f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise_seq {ema_noise_g:.3f}  "
                 f"({dt:.1f}s)"
             )
 
