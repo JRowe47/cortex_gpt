@@ -1,4 +1,3 @@
-
 # train_tiny_shakespeare_ff.py
 # ----------------------------------------------------
 # Forward-Forward (Hinton) training loop for a 7-region Transformer on Tiny Shakespeare.
@@ -48,12 +47,15 @@ except Exception:
     try:
         from cortex_model import GPT, GPTConfig  # alt path in your repo
     except Exception as e:
-        raise RuntimeError("Could not import GPT/GPTConfig from model.py or cortex_model.py") from e
+        raise RuntimeError(
+            "Could not import GPT/GPTConfig from model.py or cortex_model.py"
+        ) from e
 
 
 # ---------------------------
 # Dataset (byte-level LM data)
 # ---------------------------
+
 
 def maybe_download_shakespeare(data_dir: str):
     os.makedirs(data_dir, exist_ok=True)
@@ -84,12 +86,14 @@ def load_bytes_dataset(data_dir: str) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 @torch.no_grad()
-def eval_lm(model: nn.Module,
-            data: torch.Tensor,
-            block_size: int,
-            batch_size: int,
-            steps: int,
-            device: torch.device) -> float:
+def eval_lm(
+    model: nn.Module,
+    data: torch.Tensor,
+    block_size: int,
+    batch_size: int,
+    steps: int,
+    device: torch.device,
+) -> float:
     """Simple LM NLL evaluation on a byte dataset."""
     model.eval()
     tot = 0.0
@@ -101,11 +105,13 @@ def eval_lm(model: nn.Module,
                 f"data length {len(data)} insufficient for block_size {block_size}"
             )
         ix = torch.randint(0, max_start, (batch_size,), device=device)
-        x = torch.stack([data[i:i + block_size] for i in ix], dim=0)
-        y = torch.stack([data[i + 1:i + block_size + 1] for i in ix], dim=0)
+        x = torch.stack([data[i : i + block_size] for i in ix], dim=0)
+        y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix], dim=0)
         logits, _ = model(x, targets=None)
         V = logits.size(-1)
-        nll = F.nll_loss(logits.view(-1, V), y.view(-1), ignore_index=-1, reduction='mean')
+        nll = F.nll_loss(
+            logits.view(-1, V), y.view(-1), ignore_index=-1, reduction="mean"
+        )
         tot += float(nll)
         cnt += 1
     return tot / max(1, cnt)
@@ -119,8 +125,13 @@ def ppl_from_nll(nll: float) -> float:
     return math.exp(nll)
 
 
-def get_batch_bytes(split_data: torch.Tensor, batch_size: int, block_size: int, device: torch.device,
-                    posneg_negatives: int = 1):
+def get_batch_bytes(
+    split_data: torch.Tensor,
+    batch_size: int,
+    block_size: int,
+    device: torch.device,
+    posneg_negatives: int = 1,
+):
     """
     Returns (pos_seq, neg_seq), each LongTensor of shape [B, T]
       - Build sequences where the last token is the "candidate next token".
@@ -138,7 +149,7 @@ def get_batch_bytes(split_data: torch.Tensor, batch_size: int, block_size: int, 
             " Reduce block_size or provide more data."
         )
     ix = torch.randint(low=0, high=max_start, size=(B,), device=device)
-    ctx = torch.stack([split_data[i:i + (T - 1)] for i in ix], dim=0)  # [B, T-1]
+    ctx = torch.stack([split_data[i : i + (T - 1)] for i in ix], dim=0)  # [B, T-1]
     y_true = torch.stack([split_data[i + (T - 1)] for i in ix], dim=0)  # [B]
 
     pos_seq = torch.cat([ctx, y_true.unsqueeze(1)], dim=1)  # [B, T]
@@ -162,6 +173,7 @@ def get_batch_bytes(split_data: torch.Tensor, batch_size: int, block_size: int, 
 # ---------------------------
 # Forward-Forward utilities
 # ---------------------------
+
 
 def get_blocks(model: nn.Module) -> List[nn.Module]:
     """
@@ -192,12 +204,16 @@ def get_blocks(model: nn.Module) -> List[nn.Module]:
             # naive heuristic: block outputs same shape as input; we can't check shapes here
             blocks.append(mod)
     if not blocks:
-        raise RuntimeError("Could not find model blocks. Please expose model.transformer.h or adjust get_blocks().")
+        raise RuntimeError(
+            "Could not find model blocks. Please expose model.transformer.h or adjust get_blocks()."
+        )
     return blocks
 
 
 @torch.no_grad()
-def snapshot_block_inputs(model: nn.Module, x: torch.Tensor, blocks: List[nn.Module]) -> List[torch.Tensor]:
+def snapshot_block_inputs(
+    model: nn.Module, x: torch.Tensor, blocks: List[nn.Module]
+) -> List[torch.Tensor]:
     """
     Run a forward pass, capturing the *inputs* to each block.
     We use forward_pre_hooks to record the tensors fed into each residual block.
@@ -205,10 +221,12 @@ def snapshot_block_inputs(model: nn.Module, x: torch.Tensor, blocks: List[nn.Mod
     cached_inputs: List[Optional[torch.Tensor]] = [None for _ in blocks]
 
     handles = []
+
     def make_pre_hook(idx):
         def hook(mod, mod_input):
             # mod_input is a tuple; take first element (x)
             cached_inputs[idx] = mod_input[0].detach()
+
         return hook
 
     for i, blk in enumerate(blocks):
@@ -222,12 +240,16 @@ def snapshot_block_inputs(model: nn.Module, x: torch.Tensor, blocks: List[nn.Mod
     # assert we got all inputs
     for i, t in enumerate(cached_inputs):
         if t is None:
-            raise RuntimeError(f"Did not capture input for block {i}. "
-                               f"Adjust hook logic for your model.")
+            raise RuntimeError(
+                f"Did not capture input for block {i}. "
+                f"Adjust hook logic for your model."
+            )
     return cached_inputs  # list of [B, T, C] tensors
 
 
-def layer_goodness(x: torch.Tensor, token_index: int = -1, eps: float = 1e-6) -> torch.Tensor:
+def layer_goodness(
+    x: torch.Tensor, token_index: int = -1, eps: float = 1e-6
+) -> torch.Tensor:
     """
     Hinton-style 'goodness' = mean of squared activations (after nonlinearity).
     We take the goodness at a particular token position (default: last token).
@@ -237,12 +259,14 @@ def layer_goodness(x: torch.Tensor, token_index: int = -1, eps: float = 1e-6) ->
     # If the model uses LN + residuals, post-block activations should already be after nonlinearity.
     # We'll compute goodness on the block *output* (or recomputation output).
     x_last = x[:, token_index, :]  # [B, C]
-    g = (x_last ** 2).mean(dim=1)  # [B]
+    g = (x_last**2).mean(dim=1)  # [B]
     # numerical stability
     return g + eps
 
 
-def ff_binary_loss(goodness: torch.Tensor, y_posneg: torch.Tensor, theta: float = 2.0) -> torch.Tensor:
+def ff_binary_loss(
+    goodness: torch.Tensor, y_posneg: torch.Tensor, theta: float = 2.0
+) -> torch.Tensor:
     """
     Logistic loss on goodness values with a margin/threshold theta.
     y_posneg: +1 for positive, -1 for negative, shape [N]
@@ -256,12 +280,15 @@ def ff_binary_loss(goodness: torch.Tensor, y_posneg: torch.Tensor, theta: float 
 # Build model with ~15M params and 7-region topology
 # ---------------------------
 
-def build_7region_15M_model(block_size: int,
-                            vocab_size: int = 256,
-                            n_layer: int = 8,
-                            n_head: int = 6,
-                            n_embd: int = 384,
-                            **extra_cfg):
+
+def build_7region_15M_model(
+    block_size: int,
+    vocab_size: int = 256,
+    n_layer: int = 8,
+    n_head: int = 6,
+    n_embd: int = 384,
+    **extra_cfg,
+):
     """
     Defaults chosen to land near ~15M params for a GPT-like arch:
       per-block params approx ~12 * n_embd^2; with n_embd=384, n_layer=8 -> ~14.16M + embeddings & heads.
@@ -276,11 +303,11 @@ def build_7region_15M_model(block_size: int,
         dropout=0.0,
         bias=True,
         # --- HTM / sparsity / dendrites ---
-        kwta_frac=0.20,                # turn on sparsity (20% winners)
+        kwta_frac=0.20,  # turn on sparsity (20% winners)
         use_dendrites=True,
         dendrite_segments=8,
         # --- ROPE / FEROPE anchors ---
-        ff_mode='sumsq',
+        ff_mode="sumsq",
         ferope_anchor_relative=True,
         anchor_min_gap=32,
         anchor_jitter=8,
@@ -288,7 +315,7 @@ def build_7region_15M_model(block_size: int,
         rope_base=10000.0,
         # --- 7-region local attention ---
         use_block_sparse=True,
-        neighbor_rings=1,              # 1 ring -> 7 regions (center + 6 neighbors)
+        neighbor_rings=1,  # 1 ring -> 7 regions (center + 6 neighbors)
         # --- heads / auxiliaries ---
         tie_weights=True,
         use_mfs_head=True,
@@ -314,8 +341,13 @@ def build_7region_15M_model(block_size: int,
 # Per-layer optimizer helpers
 # ---------------------------
 
-def per_layer_optimizers(model: nn.Module, blocks: List[nn.Module],
-                         lr: float = 3e-4, weight_decay: float = 0.01) -> List[torch.optim.Optimizer]:
+
+def per_layer_optimizers(
+    model: nn.Module,
+    blocks: List[nn.Module],
+    lr: float = 3e-4,
+    weight_decay: float = 0.01,
+) -> List[torch.optim.Optimizer]:
     """
     Create an AdamW optimizer per residual block.
     """
@@ -326,7 +358,9 @@ def per_layer_optimizers(model: nn.Module, blocks: List[nn.Module],
             # just in case
             opts.append(None)
             continue
-        opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95))
+        opt = torch.optim.AdamW(
+            params, lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95)
+        )
         opts.append(opt)
     return opts
 
@@ -334,6 +368,7 @@ def per_layer_optimizers(model: nn.Module, blocks: List[nn.Module],
 # ---------------------------
 # Training (FF)
 # ---------------------------
+
 
 def train_ff(args):
     use_cpu = getattr(args, "cpu", False)
@@ -360,15 +395,19 @@ def train_ff(args):
     approx_M = num_params / 1e6
     print(f"Model params: {approx_M:.2f}M  (target ~{args.target_params_m:.1f}M)")
     if abs(approx_M - args.target_params_m) > 3.0:
-        print("Warning: parameter count is not within ±3M of target. "
-              "Adjust n_layer/n_embd if you need to be closer.")
+        print(
+            "Warning: parameter count is not within ±3M of target. "
+            "Adjust n_layer/n_embd if you need to be closer."
+        )
 
     # Extract residual blocks
     blocks = get_blocks(model)
     print(f"Found {len(blocks)} residual blocks for local FF updates.")
 
     # Per-layer optimizers
-    opts = per_layer_optimizers(model, blocks, lr=args.lr, weight_decay=args.weight_decay)
+    opts = per_layer_optimizers(
+        model, blocks, lr=args.lr, weight_decay=args.weight_decay
+    )
 
     # Optional: gradient clipping
     grad_clip = args.grad_clip
@@ -378,22 +417,31 @@ def train_ff(args):
     last_log = time.time()
     ema_pos_g = None
     ema_neg_g = None
+    ema_noise_g = None
 
     for step in range(1, args.steps + 1):
         # --- Build a minibatch of positive and negative sequences ---
-        pos_seq, neg_seq = get_batch_bytes(train_data, args.batch_size, args.block_size, device,
-                                           posneg_negatives=args.negatives)
+        pos_seq, neg_seq = get_batch_bytes(
+            train_data,
+            args.batch_size,
+            args.block_size,
+            device,
+            posneg_negatives=args.negatives,
+        )
         # --- Capture *inputs* to each block for pos/neg via one forward pass each ---
         with torch.no_grad():
             pos_inputs_per_block = snapshot_block_inputs(model, pos_seq, blocks)
             if neg_seq is not None:
                 # We use only one negative set for local losses; you can extend to K>1 below
-                neg_inputs_per_block = snapshot_block_inputs(model, neg_seq[:, 0, :], blocks)
+                neg_inputs_per_block = snapshot_block_inputs(
+                    model, neg_seq[:, 0, :], blocks
+                )
             else:
                 neg_inputs_per_block = None
 
         # --- Per-layer local FF update ---
         total_loss_this_step = 0.0
+        g_pos = g_neg = g_noise = None  # last block metrics
         for li, blk in enumerate(blocks):
             opt = opts[li]
             if opt is None:
@@ -403,21 +451,43 @@ def train_ff(args):
             # Re-run THIS block on detached cached inputs so grads do not flow into earlier layers
             x_pos_in = pos_inputs_per_block[li].detach().requires_grad_(True)
             y_pos = blk(x_pos_in)
-            g_pos = layer_goodness(y_pos, token_index=-1)   # [B]
+            g_pos = layer_goodness(y_pos, token_index=-1)  # [B]
+
+            # Gaussian noise based "bad" activations using pos activations
+            if args.noise_std > 0:
+                act_std = y_pos.std().detach()
+                noise = torch.randn_like(y_pos) * act_std * args.noise_std
+                g_noise = layer_goodness(y_pos + noise, token_index=-1)  # [B]
+            else:
+                g_noise = None
 
             if neg_inputs_per_block is not None:
                 x_neg_in = neg_inputs_per_block[li].detach().requires_grad_(True)
                 y_neg = blk(x_neg_in)
                 g_neg = layer_goodness(y_neg, token_index=-1)  # [B]
 
-                # Build labels: +1 for pos, -1 for neg, concat
-                y_lbl = torch.cat([torch.ones_like(g_pos), -torch.ones_like(g_neg)], dim=0)  # [2B]
-                g_all = torch.cat([g_pos, g_neg], dim=0)  # [2B]
+                # Build labels: +1 for pos, -1 for neg/noise, concat
+                parts = [g_pos]
+                labels = [torch.ones_like(g_pos)]
+                parts.append(g_neg)
+                labels.append(-torch.ones_like(g_neg))
+                if g_noise is not None:
+                    parts.append(g_noise)
+                    labels.append(-torch.ones_like(g_noise))
+                g_all = torch.cat(parts, dim=0)
+                y_lbl = torch.cat(labels, dim=0)
                 loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
             else:
                 # Positive-only regularization toward a target goodness (rarely used)
-                y_lbl = torch.ones_like(g_pos)
-                loss_l = ff_binary_loss(g_pos, y_lbl, theta=args.theta)
+                if g_noise is not None:
+                    g_all = torch.cat([g_pos, g_noise], dim=0)
+                    y_lbl = torch.cat(
+                        [torch.ones_like(g_pos), -torch.ones_like(g_noise)], dim=0
+                    )
+                    loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
+                else:
+                    y_lbl = torch.ones_like(g_pos)
+                    loss_l = ff_binary_loss(g_pos, y_lbl, theta=args.theta)
 
             loss_l.backward()
             # Optional grad clip per block
@@ -429,31 +499,51 @@ def train_ff(args):
 
         # --- Simple metrics/logging ---
         with torch.no_grad():
-            mean_pos = float(g_pos.mean()) if 'g_pos' in locals() else float('nan')
-            mean_neg = float(g_neg.mean()) if 'g_neg' in locals() else float('nan')
-            ema_pos_g = mean_pos if ema_pos_g is None else 0.98 * ema_pos_g + 0.02 * mean_pos
-            ema_neg_g = mean_neg if ema_neg_g is None else 0.98 * ema_neg_g + 0.02 * mean_neg
+            mean_pos = float(g_pos.mean()) if g_pos is not None else float("nan")
+            mean_neg = float(g_neg.mean()) if g_neg is not None else float("nan")
+            mean_noise = float(g_noise.mean()) if g_noise is not None else float("nan")
+            ema_pos_g = (
+                mean_pos if ema_pos_g is None else 0.98 * ema_pos_g + 0.02 * mean_pos
+            )
+            ema_neg_g = (
+                mean_neg if ema_neg_g is None else 0.98 * ema_neg_g + 0.02 * mean_neg
+            )
+            ema_noise_g = (
+                mean_noise
+                if ema_noise_g is None
+                else 0.98 * ema_noise_g + 0.02 * mean_noise
+            )
 
         global_step += 1
         if step % args.log_interval == 0 or step == 1:
             dt = time.time() - last_log
             last_log = time.time()
-            print(f"step {step:6d}/{args.steps}  "
-                  f"ff_loss {total_loss_this_step:.4f}  "
-                  f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  "
-                  f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  "
-                  f"({dt:.1f}s)")
+            print(
+                f"step {step:6d}/{args.steps}  "
+                f"ff_loss {total_loss_this_step:.4f}  "
+                f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  "
+                f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise {ema_noise_g:.3f}  "
+                f"({dt:.1f}s)"
+            )
 
         # Evaluation: goodness probe + LM metrics for parity with backprop run
         if args.eval_interval > 0 and step % args.eval_interval == 0:
             model.eval()
             with torch.no_grad():
                 # LM NLL / bpc / ppl
-                val_lm = eval_lm(model, val_data, args.block_size, args.batch_size,
-                                 steps=args.eval_batches, device=device)
+                val_lm = eval_lm(
+                    model,
+                    val_data,
+                    args.block_size,
+                    args.batch_size,
+                    steps=args.eval_batches,
+                    device=device,
+                )
                 bpc = bpc_from_nll(val_lm)
                 ppl = ppl_from_nll(val_lm)
-                print(f"[eval] step {step:6d}  val_lm_nll {val_lm:.4f}  bpc {bpc:.3f}  ppl {ppl:.2f}")
+                print(
+                    f"[eval] step {step:6d}  val_lm_nll {val_lm:.4f}  bpc {bpc:.3f}  ppl {ppl:.2f}"
+                )
 
                 # Optional goodness gap on val split
                 val_block_size = min(args.block_size, len(val_data))
@@ -466,16 +556,26 @@ def train_ff(args):
                 )
                 vpos_in = snapshot_block_inputs(model, vpos, blocks)[-1]
                 vneg_in = snapshot_block_inputs(model, vneg[:, 0, :], blocks)[-1]
-                v_g_pos = layer_goodness(blocks[-1](vpos_in), token_index=-1).mean().item()
-                v_g_neg = layer_goodness(blocks[-1](vneg_in), token_index=-1).mean().item()
-                print(f"[val probe] goodness last-block: pos {v_g_pos:.3f}  neg {v_g_neg:.3f}  gap {v_g_pos - v_g_neg:.3f}")
+                v_g_pos = (
+                    layer_goodness(blocks[-1](vpos_in), token_index=-1).mean().item()
+                )
+                v_g_neg = (
+                    layer_goodness(blocks[-1](vneg_in), token_index=-1).mean().item()
+                )
+                print(
+                    f"[val probe] goodness last-block: pos {v_g_pos:.3f}  neg {v_g_neg:.3f}  gap {v_g_pos - v_g_neg:.3f}"
+                )
             model.train()
 
         # Save checkpoint
         if args.ckpt_interval > 0 and step % args.ckpt_interval == 0:
             ckpt = {
                 "model": model.state_dict(),
-                "config": gpt_conf.__dict__ if hasattr(gpt_conf, '__dict__') else dict(gpt_conf),
+                "config": (
+                    gpt_conf.__dict__
+                    if hasattr(gpt_conf, "__dict__")
+                    else dict(gpt_conf)
+                ),
                 "args": vars(args),
                 "step": step,
             }
@@ -487,17 +587,22 @@ def train_ff(args):
     # Final save
     os.makedirs(args.out_dir, exist_ok=True)
     final_path = os.path.join(args.out_dir, "ff_final.pt")
-    torch.save({
-        "model": model.state_dict(),
-        "config": gpt_conf.__dict__ if hasattr(gpt_conf, '__dict__') else dict(gpt_conf),
-    }, final_path)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": (
+                gpt_conf.__dict__ if hasattr(gpt_conf, "__dict__") else dict(gpt_conf)
+            ),
+        },
+        final_path,
+    )
     print(f"Saved final model to {final_path}")
 
     # Quick sample for sanity, using standard autoregressive generation
     model.eval()
     ctx = torch.randint(0, 256, (1, min(64, args.block_size)), device=device)
     out = model.generate(ctx, max_new_tokens=200, temperature=1.0, top_k=50)
-    sample = bytes(out[0].tolist()).decode('utf-8', errors='ignore')
+    sample = bytes(out[0].tolist()).decode("utf-8", errors="ignore")
     print("\n=== Sample ===")
     print(sample)
 
@@ -506,35 +611,40 @@ def train_ff(args):
 # FF-based generation (optional, slow)
 # ---------------------------
 
+
 @torch.no_grad()
-def ff_generate(model: nn.Module,
-                blocks: List[nn.Module],
-                idx: torch.Tensor,
-                max_new_tokens: int,
-                block_size: int,
-                device: torch.device,
-                vocab_size: int = 256,
-                theta: float = 2.0,
-                num_candidates: int = 64) -> torch.Tensor:
+def ff_generate(
+    model: nn.Module,
+    blocks: List[nn.Module],
+    idx: torch.Tensor,
+    max_new_tokens: int,
+    block_size: int,
+    device: torch.device,
+    vocab_size: int = 256,
+    theta: float = 2.0,
+    num_candidates: int = 64,
+) -> torch.Tensor:
     """
     Slow FF generation: at each step, try a subset of candidate next tokens and pick the one
     with the highest aggregated goodness across blocks.
     """
     model.eval()
     for _ in range(max_new_tokens):
-        ctx = idx[:, - (block_size - 1):] if idx.size(1) >= block_size else idx
+        ctx = idx[:, -(block_size - 1) :] if idx.size(1) >= block_size else idx
         B = ctx.size(0)
         # Sample candidate tokens to score (for speed). You can also brute-force 0..255.
-        cand = torch.randint(0, vocab_size, (B, num_candidates), device=device, dtype=torch.long)  # [B, K]
+        cand = torch.randint(
+            0, vocab_size, (B, num_candidates), device=device, dtype=torch.long
+        )  # [B, K]
         best_tokens = []
         for b in range(B):
             # ensure the true next token could be in the set if you want to test ground-truth scoring
             # For pure generation, we just sample K tokens.
-            ctx_b = ctx[b:b+1, :]  # [1, t]
+            ctx_b = ctx[b : b + 1, :]  # [1, t]
             best_g = -1e9
             best_tok = 0
             for k in range(num_candidates):
-                seq = torch.cat([ctx_b, cand[b:b+1, k:k+1]], dim=1)  # [1, t+1]
+                seq = torch.cat([ctx_b, cand[b : b + 1, k : k + 1]], dim=1)  # [1, t+1]
                 inputs_per_block = snapshot_block_inputs(model, seq, blocks)
                 # Aggregate goodness across all blocks for the final token
                 g_total = 0.0
@@ -546,7 +656,13 @@ def ff_generate(model: nn.Module,
                     best_g = g_total
                     best_tok = int(cand[b, k].item())
             best_tokens.append(best_tok)
-        idx = torch.cat([idx, torch.tensor(best_tokens, device=device, dtype=torch.long).unsqueeze(1)], dim=1)
+        idx = torch.cat(
+            [
+                idx,
+                torch.tensor(best_tokens, device=device, dtype=torch.long).unsqueeze(1),
+            ],
+            dim=1,
+        )
     return idx
 
 
@@ -554,22 +670,62 @@ def ff_generate(model: nn.Module,
 # CLI
 # ---------------------------
 
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Forward-Forward training for Tiny Shakespeare (7-region model)")
-    p.add_argument("--data_dir", type=str, default="data/tiny_shakespeare", help="directory with input.txt")
-    p.add_argument("--out_dir", type=str, default="out_ff", help="where to save checkpoints")
+    p = argparse.ArgumentParser(
+        description="Forward-Forward training for Tiny Shakespeare (7-region model)"
+    )
+    p.add_argument(
+        "--data_dir",
+        type=str,
+        default="data/tiny_shakespeare",
+        help="directory with input.txt",
+    )
+    p.add_argument(
+        "--out_dir", type=str, default="out_ff", help="where to save checkpoints"
+    )
     p.add_argument("--steps", type=int, default=2000)
-    p.add_argument("--eval_interval", type=int, default=200, help="val goodness probe interval (0=off)")
-    p.add_argument("--eval_batches", type=int, default=20, help="batches for LM eval at each probe")
-    p.add_argument("--ckpt_interval", type=int, default=0, help="checkpoint interval in steps (0=off)")
+    p.add_argument(
+        "--eval_interval",
+        type=int,
+        default=200,
+        help="val goodness probe interval (0=off)",
+    )
+    p.add_argument(
+        "--eval_batches", type=int, default=20, help="batches for LM eval at each probe"
+    )
+    p.add_argument(
+        "--ckpt_interval",
+        type=int,
+        default=0,
+        help="checkpoint interval in steps (0=off)",
+    )
     p.add_argument("--log_interval", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--block_size", type=int, default=128, help="context len; we use T-1 ctx + 1 candidate token")
-    p.add_argument("--negatives", type=int, default=1, help="number of negative candidates per sample (K)")
+    p.add_argument(
+        "--block_size",
+        type=int,
+        default=128,
+        help="context len; we use T-1 ctx + 1 candidate token",
+    )
+    p.add_argument(
+        "--negatives",
+        type=int,
+        default=1,
+        help="number of negative candidates per sample (K)",
+    )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--theta", type=float, default=2.0, help="goodness threshold for logistic loss")
+    p.add_argument(
+        "--theta", type=float, default=2.0, help="goodness threshold for logistic loss"
+    )
+    p.add_argument(
+        "--noise_std",
+        type=float,
+        default=0.1,
+        help="std multiplier for gaussian noise negatives",
+    )
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--cpu", action="store_true", help="force CPU")
     # Model sizing
