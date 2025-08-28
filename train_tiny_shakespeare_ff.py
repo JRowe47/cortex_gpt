@@ -365,6 +365,21 @@ def per_layer_optimizers(
     return opts
 
 
+def renorm_incoming_weights(module: nn.Module, eps: float = 1e-8) -> None:
+    """Renormalize each neuron's incoming weight vector to unit norm.
+
+    This follows Hinton's FF recommendation to keep activations bounded and
+    helps monitor when a layer's weights start to explode. We apply it after
+    each local optimizer step.
+    """
+    for p in module.parameters():
+        if p.ndim >= 2:
+            w = p.data.view(p.size(0), -1)
+            norms = w.norm(dim=1, keepdim=True).clamp(min=eps)
+            w.div_(norms)
+            p.data.copy_(w.view_as(p))
+
+
 # ---------------------------
 # Training (FF)
 # ---------------------------
@@ -435,6 +450,18 @@ def train_ff(args):
     ema_noise_g = None
 
     for step in range(1, args.steps + 1):
+        # optional linear LR decay
+        cur_lr = args.lr
+        if args.lr_final is not None:
+            t = (step - 1) / max(1, args.steps - 1)
+            cur_lr = args.lr + t * (args.lr_final - args.lr)
+            for opt in opts:
+                if opt is not None:
+                    for pg in opt.param_groups:
+                        pg["lr"] = cur_lr
+            if head_opt is not None:
+                for pg in head_opt.param_groups:
+                    pg["lr"] = cur_lr
         # --- Build a minibatch of positive and negative sequences ---
         pos_seq, neg_seq = get_batch_bytes(
             train_data,
@@ -462,9 +489,19 @@ def train_ff(args):
         total_loss_this_step = 0.0
         head_ce = 0.0
         g_pos = g_neg = g_noise_gauss = g_noise_pure = None  # last block metrics
+        layer_pos_means = []
+        layer_neg_means = []
+        layer_noise_means = []
+        layer_grad_norms = []
+        layer_weight_norms = []
+
         for li, blk in enumerate(blocks):
             opt = opts[li]
             if opt is None:
+                layer_pos_means.append(float("nan"))
+                layer_neg_means.append(float("nan"))
+                layer_noise_means.append(float("nan"))
+                layer_grad_norms.append(0.0)
                 continue
             opt.zero_grad(set_to_none=True)
 
@@ -516,10 +553,32 @@ def train_ff(args):
                     loss_l = ff_binary_loss(g_pos, y_lbl, theta=args.theta)
 
             loss_l.backward()
-            # Optional grad clip per block
+            # Optional grad clip per block and capture grad norm for debugging
             if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(blk.parameters(), grad_clip)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(blk.parameters(), grad_clip))
+            else:
+                grad_norm = math.sqrt(
+                    sum(
+                        (p.grad.detach().pow(2).sum().item())
+                        for p in blk.parameters()
+                        if p.grad is not None
+                    )
+                )
             opt.step()
+
+            if args.renorm:
+                renorm_incoming_weights(blk)
+            w_norm = math.sqrt(
+                sum(p.detach().pow(2).sum().item() for p in blk.parameters())
+            )
+
+            layer_pos_means.append(float(g_pos.mean()))
+            layer_neg_means.append(float(g_neg.mean()) if g_neg is not None else float("nan"))
+            layer_noise_means.append(
+                float(g_noise_pure.mean()) if g_noise_pure is not None else float("nan")
+            )
+            layer_grad_norms.append(grad_norm)
+            layer_weight_norms.append(w_norm)
 
             total_loss_this_step += float(loss_l.detach())
 
@@ -530,11 +589,11 @@ def train_ff(args):
                 final_in = snapshot_block_inputs(model, pos_seq, blocks)[-1]
                 final_h = blocks[-1](final_in)
             if hasattr(model, "lm_head_mfs"):
-                head_logits = model.lm_head_mfs(final_h)
+                head_logp = model.lm_head_mfs(final_h, return_logprobs=True)
             else:
-                head_logits = model.lm_head(final_h)
+                head_logp = model.lm_head(final_h).log_softmax(dim=-1)
             target = pos_seq[:, -1]
-            ce_loss = F.cross_entropy(head_logits[:, -1, :], target)
+            ce_loss = F.nll_loss(head_logp[:, -1, :], target)
             ce_loss.backward()
             if grad_clip is not None and grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(head_params, grad_clip)
@@ -574,7 +633,20 @@ def train_ff(args):
                 f"head_ce {head_ce:.4f}  "
                 f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  g_noise_seq {mean_noise_seq:.3f}  "
                 f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise_seq {ema_noise_g:.3f}  "
+                f"lr {cur_lr:.2e}  "
                 f"({dt:.1f}s)"
+            )
+            print(
+                "    layer_pos "
+                + str([round(v, 3) for v in layer_pos_means])
+                + " layer_neg "
+                + str([round(v, 3) for v in layer_neg_means])
+                + " layer_noise "
+                + str([round(v, 3) for v in layer_noise_means])
+                + " grad_norms "
+                + str([round(v, 3) for v in layer_grad_norms])
+                + " w_norms "
+                + str([round(v, 3) for v in layer_weight_norms])
             )
 
         # Evaluation: goodness probe + LM metrics for parity with backprop run
@@ -605,16 +677,22 @@ def train_ff(args):
                     device,
                     posneg_negatives=1,
                 )
-                vpos_in = snapshot_block_inputs(model, vpos, blocks)[-1]
-                vneg_in = snapshot_block_inputs(model, vneg[:, 0, :], blocks)[-1]
-                v_g_pos = (
-                    layer_goodness(blocks[-1](vpos_in), token_index=-1).mean().item()
-                )
-                v_g_neg = (
-                    layer_goodness(blocks[-1](vneg_in), token_index=-1).mean().item()
+                vpos_inputs = snapshot_block_inputs(model, vpos, blocks)
+                vneg_inputs = snapshot_block_inputs(model, vneg[:, 0, :], blocks)
+                per_block = []
+                for li, blk in enumerate(blocks):
+                    vp = layer_goodness(blk(vpos_inputs[li]), token_index=-1).mean().item()
+                    vn = layer_goodness(blk(vneg_inputs[li]), token_index=-1).mean().item()
+                    per_block.append((vp, vn))
+                last_pos, last_neg = per_block[-1]
+                print(
+                    "[val probe] goodness per-block pos/neg: "
+                    + " ".join(
+                        f"{i}:{p:.2f}/{n:.2f}" for i, (p, n) in enumerate(per_block)
+                    )
                 )
                 print(
-                    f"[val probe] goodness last-block: pos {v_g_pos:.3f}  neg {v_g_neg:.3f}  gap {v_g_pos - v_g_neg:.3f}"
+                    f"[val probe] last-block gap: pos {last_pos:.3f}  neg {last_neg:.3f}  gap {last_pos - last_neg:.3f}"
                 )
             model.train()
 
@@ -673,20 +751,24 @@ def ff_generate(
     device: torch.device,
     vocab_size: int = 256,
     theta: float = 2.0,
-    num_candidates: int = 64,
+    num_candidates: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Slow FF generation: at each step, try a subset of candidate next tokens and pick the one
-    with the highest aggregated goodness across blocks.
+    Slow FF generation: at each step, score candidate next tokens and pick the
+    one with the highest aggregated goodness across blocks. If `num_candidates`
+    is None or >= vocab_size, all tokens in the vocabulary are evaluated.
     """
     model.eval()
     for _ in range(max_new_tokens):
         ctx = idx[:, -(block_size - 1) :] if idx.size(1) >= block_size else idx
         B = ctx.size(0)
         # Sample candidate tokens to score (for speed). You can also brute-force 0..255.
-        cand = torch.randint(
-            0, vocab_size, (B, num_candidates), device=device, dtype=torch.long
-        )  # [B, K]
+        if num_candidates is None or num_candidates >= vocab_size:
+            cand = torch.arange(vocab_size, device=device).unsqueeze(0).repeat(B, 1)
+        else:
+            cand = torch.randint(
+                0, vocab_size, (B, num_candidates), device=device, dtype=torch.long
+            )
         best_tokens = []
         for b in range(B):
             # ensure the true next token could be in the set if you want to test ground-truth scoring
@@ -766,6 +848,12 @@ def parse_args():
         help="number of negative candidates per sample (K)",
     )
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--lr_final",
+        type=float,
+        default=None,
+        help="final learning rate for linear decay (defaults to no decay)",
+    )
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument(
@@ -784,6 +872,13 @@ def parse_args():
     p.add_argument("--n_head", type=int, default=6)
     p.add_argument("--n_embd", type=int, default=384)
     p.add_argument("--target_params_m", type=float, default=15.0)
+    p.add_argument(
+        "--no_renorm",
+        action="store_false",
+        dest="renorm",
+        help="disable weight renormalization after each block update",
+    )
+    p.set_defaults(renorm=True)
     return p.parse_args()
 
 
