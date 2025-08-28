@@ -336,7 +336,11 @@ def per_layer_optimizers(model: nn.Module, blocks: List[nn.Module],
 # ---------------------------
 
 def train_ff(args):
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    use_cpu = getattr(args, "cpu", False)
+    if not use_cpu and not torch.cuda.is_available():
+        print("WARNING: CUDA is not available, falling back to CPU")
+        use_cpu = True
+    device = torch.device("cuda" if not use_cpu else "cpu")
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
