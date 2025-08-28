@@ -409,6 +409,21 @@ def train_ff(args):
         model, blocks, lr=args.lr, weight_decay=args.weight_decay
     )
 
+    # Optimizer for the token embedding + LM head (ties to embedding if configured).
+    head_params = []
+    if hasattr(model, "lm_head_mfs"):
+        head_params.extend(p for p in model.lm_head_mfs.parameters() if p.requires_grad)
+    if hasattr(model, "lm_head"):
+        head_params.extend(p for p in model.lm_head.parameters() if p.requires_grad)
+    # include token embedding (shared when tie_weights=True)
+    if hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
+        head_params.extend(p for p in model.transformer.wte.parameters() if p.requires_grad)
+    head_opt = (
+        torch.optim.AdamW(head_params, lr=args.lr, weight_decay=args.weight_decay)
+        if head_params
+        else None
+    )
+
     # Optional: gradient clipping
     grad_clip = args.grad_clip
 
@@ -441,6 +456,7 @@ def train_ff(args):
 
         # --- Per-layer local FF update ---
         total_loss_this_step = 0.0
+        head_ce = 0.0
         g_pos = g_neg = g_noise = None  # last block metrics
         for li, blk in enumerate(blocks):
             opt = opts[li]
@@ -497,6 +513,25 @@ def train_ff(args):
 
             total_loss_this_step += float(loss_l.detach())
 
+        # --- Local cross-entropy update for LM head / embeddings ---
+        if head_opt is not None:
+            head_opt.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                final_in = snapshot_block_inputs(model, pos_seq, blocks)[-1]
+                final_h = blocks[-1](final_in)
+            if hasattr(model, "lm_head_mfs"):
+                head_logits = model.lm_head_mfs(final_h)
+            else:
+                head_logits = model.lm_head(final_h)
+            target = pos_seq[:, -1]
+            ce_loss = F.cross_entropy(head_logits[:, -1, :], target)
+            ce_loss.backward()
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(head_params, grad_clip)
+            head_opt.step()
+            head_ce = float(ce_loss.detach())
+            total_loss_this_step += head_ce
+
         # --- Simple metrics/logging ---
         with torch.no_grad():
             mean_pos = float(g_pos.mean()) if g_pos is not None else float("nan")
@@ -521,6 +556,7 @@ def train_ff(args):
             print(
                 f"step {step:6d}/{args.steps}  "
                 f"ff_loss {total_loss_this_step:.4f}  "
+                f"head_ce {head_ce:.4f}  "
                 f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  "
                 f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise {ema_noise_g:.3f}  "
                 f"({dt:.1f}s)"
