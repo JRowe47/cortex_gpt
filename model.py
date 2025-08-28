@@ -166,6 +166,33 @@ class RegionRouter:
 
 
 # ---------------------------------------------------------------------
+# RegionColumns: fixed number of column slots pooled from tokens
+# ---------------------------------------------------------------------
+class RegionColumns:
+    """Aggregate token features into a fixed set of column slots."""
+
+    def __init__(self, n_cols:int, T:int, device):
+        self.n_cols = n_cols
+        # simple even assignment of tokens to column slots
+        self.assign = torch.linspace(0, n_cols - 1, steps=T, device=device).long()
+
+    def pool(self, h: torch.Tensor, reduce:str="mean") -> torch.Tensor:
+        """h:[B,T,D] -> [B,n_cols,D] aggregated per column."""
+        B,T,D = h.shape
+        idx = self.assign.view(1, T, 1).expand(B, T, D)
+        out = h.new_zeros(B, self.n_cols, D)
+        out.scatter_add_(1, idx, h)
+        if reduce == "mean":
+            counts = torch.bincount(self.assign, minlength=self.n_cols).clamp_min(1)
+            counts = counts.view(1, self.n_cols, 1).to(h.device)
+            out = out / counts
+        return out
+
+    def broadcast(self, cols: torch.Tensor) -> torch.Tensor:
+        """cols:[B,n_cols,D] -> [B,T,D] by column assignment."""
+        return cols.index_select(1, self.assign)
+
+# ---------------------------------------------------------------------
 # Attention block with Fe‑RoPE (anchor‑relative) + PDS block sparsity
 # ---------------------------------------------------------------------
 
@@ -375,6 +402,9 @@ class GPTConfig:
     rope_base: float = 10000.0
     use_block_sparse: bool = True
     neighbor_rings: int = 1
+
+    # Region columns
+    n_region_cols: int = 256
 
     # Heads
     tie_weights: bool = True
@@ -595,55 +625,58 @@ class GPT(nn.Module):
         logits = None
         loss = None
 
+        # --- Column aggregation ---
+        col_router = RegionColumns(self.config.n_region_cols, t, device=device)
+        cols = col_router.pool(x)  # [B,n_cols,D]
+
         # --- Prepare slates ---
-        # Cheap local slate (acts as L6 prior stand-in)
         if hasattr(self, "_make_local_slate"):
-            local_slate = self._make_local_slate(x)
+            local_slate = self._make_local_slate(cols)
         else:
-            local_slate = self._make_slate(x)  # backwards-compat
+            local_slate = self._make_slate(cols)
 
         region_slate = None
-        error_scalar = None  # [B,T,1]
+        error_scalar = None  # [B,n_cols,1]
         aux = None
 
-        # --- Optional L4 auxiliary losses + error scalar for region slate ---
+        # --- Optional L4 auxiliary losses + error scalar ---
         if getattr(self, "_add_l4_losses", False) and targets is not None and hasattr(self, "l4_head"):
-            # Build next-step labels; ignore last position with -1
-            next_targets = torch.roll(targets, shifts=-1, dims=1)
-            next_targets[:, -1] = -1
+            next_targets = torch.full((b, self.config.n_region_cols), -1, device=device, dtype=targets.dtype)
+            next_targets[:, :min(t-1, self.config.n_region_cols)] = targets[:, 1:min(t, self.config.n_region_cols+1)]
+            col_targets = torch.full((b, self.config.n_region_cols), -1, device=device, dtype=targets.dtype)
+            col_targets[:, :min(t, self.config.n_region_cols)] = targets[:, :min(t, self.config.n_region_cols)]
 
-            # (A) Proper CE/NLL auxiliaries (the AE returns log-probs internally)
             l_rec, l_nxt = self.l4_head(
-                x, slate=local_slate,
-                targets=targets, next_targets=next_targets,
+                cols, slate=local_slate,
+                targets=col_targets, next_targets=next_targets,
                 return_losses=True
             )
             if torch.is_tensor(l_rec): l_rec = l_rec.mean()
             if torch.is_tensor(l_nxt): l_nxt = l_nxt.mean()
             aux = l_rec + l_nxt
 
-            # (B) Tokenwise next-step NLL (no-grad) to form error_scalar for the region slate
             with torch.no_grad():
                 logp_rec, logp_nxt = self.l4_head(
-                    x, slate=local_slate,
-                    targets=targets, next_targets=next_targets,
+                    cols, slate=local_slate,
+                    targets=col_targets, next_targets=next_targets,
                     return_losses=False
-                )  # both are LOG-PROBS
+                )
                 V = logp_nxt.size(-1)
                 nll = F.nll_loss(
                     logp_nxt.view(-1, V), next_targets.view(-1),
                     reduction='none', ignore_index=-1
-                )  # [B*T]
-                error_scalar = nll.view(b, t, 1)  # [B,T,1]
+                )
+                error_scalar = nll.view(b, self.config.n_region_cols, 1)
 
         # --- Region slate (pooled anchors + prior + error) if available ---
         if getattr(self, "_use_mfs_head", False):
             if router is not None and hasattr(self, "_make_region_slate"):
                 region_slate = self._make_region_slate(
-                    x, router, prior=local_slate, error_scalar=error_scalar
+                    x, router, prior=local_slate.index_select(1, col_router.assign[:t]),
+                    error_scalar=error_scalar.index_select(1, col_router.assign[:t]) if error_scalar is not None else None,
                 )
             else:
-                region_slate = local_slate  # fallback
+                region_slate = local_slate
         else:
             region_slate = None
 
