@@ -490,6 +490,8 @@ def train_ff(args):
         # --- Per-layer local FF update ---
         total_loss_this_step = 0.0
         head_ce = 0.0
+        head_ppl = float("nan")
+        head_grad_norm = 0.0
         g_pos = g_neg = g_noise_gauss = g_noise_pure = None  # last block metrics
         layer_pos_means = []
         layer_neg_means = []
@@ -607,13 +609,26 @@ def train_ff(args):
                 head_logp = model.lm_head_mfs(final_h, return_logprobs=True)
             else:
                 head_logp = model.lm_head(final_h).log_softmax(dim=-1)
-            target = pos_seq[:, -1]
-            ce_loss = F.nll_loss(head_logp[:, -1, :], target)
+            V = head_logp.size(-1)
+            logp = head_logp[:, :-1, :]
+            target = pos_seq[:, 1:]
+            ce_loss = F.nll_loss(logp.reshape(-1, V), target.reshape(-1))
             ce_loss.backward()
             if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(head_params, grad_clip)
+                head_grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(head_params, grad_clip)
+                )
+            else:
+                head_grad_norm = math.sqrt(
+                    sum(
+                        (p.grad.detach().pow(2).sum().item())
+                        for p in head_params
+                        if p.grad is not None
+                    )
+                )
             head_opt.step()
             head_ce = float(ce_loss.detach())
+            head_ppl = math.exp(head_ce)
             total_loss_this_step += head_ce
 
         # --- Simple metrics/logging ---
@@ -645,10 +660,10 @@ def train_ff(args):
             print(
                 f"step {step:6d}/{args.steps}  "
                 f"ff_loss {total_loss_this_step:.4f}  "
-                f"head_ce {head_ce:.4f}  "
+                f"head_ce {head_ce:.4f}  head_ppl {head_ppl:.2f}  "
                 f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  g_noise_seq {mean_noise_seq:.3f}  "
                 f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise_seq {ema_noise_g:.3f}  "
-                f"lr {cur_lr:.2e}  "
+                f"lr {cur_lr:.2e}  head_grad {head_grad_norm:.3f}  "
                 f"({dt:.1f}s)"
             )
             print(
