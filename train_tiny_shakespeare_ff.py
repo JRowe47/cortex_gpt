@@ -441,6 +441,11 @@ def train_ff(args):
         head_params.extend(p for p in model.transformer.wte.parameters() if p.requires_grad)
     if hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
         head_params.extend(p for p in model.transformer.ln_f.parameters() if p.requires_grad)
+    # De-duplicate any shared parameters (e.g., tied embeddings)
+    uniq = {}
+    for p in head_params:
+        uniq[id(p)] = p
+    head_params = list(uniq.values())
     head_opt = (
         torch.optim.AdamW(head_params, lr=args.lr, weight_decay=args.weight_decay)
         if head_params
@@ -457,42 +462,67 @@ def train_ff(args):
     ema_neg_g = None
     ema_noise_g = None
 
-    for step in range(1, args.steps + 1):
-        # optional linear LR decay
-        cur_lr = args.lr
-        if args.lr_final is not None:
-            t = (step - 1) / max(1, args.steps - 1)
-            cur_lr = args.lr + t * (args.lr_final - args.lr)
-            for opt in opts:
-                if opt is not None:
-                    for pg in opt.param_groups:
-                        pg["lr"] = cur_lr
-            if head_opt is not None:
-                for pg in head_opt.param_groups:
-                    pg["lr"] = cur_lr
+    def get_lr(step: int) -> float:
+        if args.lr_final is None:
+            return args.lr
+        t = (step - 1) / max(1, args.steps - 1)
+        if args.lr_decay_style == "cosine":
+            return args.lr_final + 0.5 * (args.lr - args.lr_final) * (1 + math.cos(math.pi * t))
+        else:
+            return args.lr + t * (args.lr_final - args.lr)
 
-        # --- Build a minibatch of positive and negative sequences ---
+    for step in range(1, args.steps + 1):
+        cur_lr = get_lr(step)
+        for opt in opts:
+            if opt is not None:
+                for pg in opt.param_groups:
+                    pg["lr"] = cur_lr
+        if head_opt is not None:
+            for pg in head_opt.param_groups:
+                pg["lr"] = cur_lr
+
+        t = (step - 1) / max(1, args.steps - 1)
+        cur_negatives = args.negatives
+        if args.negatives_final is not None:
+            cur_negatives = int(
+                round(args.negatives + t * (args.negatives_final - args.negatives))
+            )
+
         pos_seq, neg_seq = get_batch_bytes(
             train_data,
             args.batch_size,
             args.block_size,
             device,
-            posneg_negatives=args.negatives,
+            posneg_negatives=cur_negatives,
         )
-        # Extra pure noise batch for monitoring collapse
-        noise_seq = torch.randint(0, 256, pos_seq.shape, device=device)
+
+        cur_noise_std = args.noise_std
+        if args.noise_std_start is not None:
+            cur_noise_std = args.noise_std_start + t * (args.noise_std - args.noise_std_start)
+        cur_noise_prob = args.noise_seq_prob_start + t * (
+            args.noise_seq_prob - args.noise_seq_prob_start
+        )
+        include_noise = random.random() < cur_noise_prob
+        noise_seq = (
+            torch.randint(0, 256, pos_seq.shape, device=device)
+            if include_noise
+            else None
+        )
 
         # --- Capture *inputs* to each block for pos/neg/noise via one forward pass each ---
         with torch.no_grad():
             pos_inputs_per_block = snapshot_block_inputs(model, pos_seq, blocks)
             if neg_seq is not None:
-                # We use only one negative set for local losses; you can extend to K>1 below
                 neg_inputs_per_block = snapshot_block_inputs(
                     model, neg_seq[:, 0, :], blocks
                 )
             else:
                 neg_inputs_per_block = None
-            noise_inputs_per_block = snapshot_block_inputs(model, noise_seq, blocks)
+            noise_inputs_per_block = (
+                snapshot_block_inputs(model, noise_seq, blocks)
+                if noise_seq is not None
+                else None
+            )
 
         # --- Per-layer local FF update ---
         total_loss_this_step = 0.0
@@ -528,17 +558,20 @@ def train_ff(args):
             g_pos = layer_goodness(y_pos, token_index=-1)  # [B]
 
             # Gaussian noise based "bad" activations using pos activations
-            if args.noise_std > 0:
+            if cur_noise_std > 0:
                 act_std = y_pos.std().detach()
-                noise = torch.randn_like(y_pos) * act_std * args.noise_std
+                noise = torch.randn_like(y_pos) * act_std * cur_noise_std
                 g_noise_gauss = layer_goodness(y_pos + noise, token_index=-1)  # [B]
             else:
                 g_noise_gauss = None
 
             # Pure noise sequence for collapse monitoring
-            x_noise_in = noise_inputs_per_block[li].detach()
-            y_noise = blk(x_noise_in)
-            g_noise_pure = layer_goodness(y_noise, token_index=-1)  # [B]
+            if noise_inputs_per_block is not None:
+                x_noise_in = noise_inputs_per_block[li].detach()
+                y_noise = blk(x_noise_in)
+                g_noise_pure = layer_goodness(y_noise, token_index=-1)  # [B]
+            else:
+                g_noise_pure = None
 
             if neg_inputs_per_block is not None:
                 x_neg_in = neg_inputs_per_block[li].detach().requires_grad_(True)
@@ -571,6 +604,10 @@ def train_ff(args):
                     y_lbl = torch.ones_like(g_pos)
                     loss_l = ff_binary_loss(g_pos, y_lbl, theta=args.theta)
                     acc = float("nan")
+
+            if args.deep_weight > 0 and len(blocks) > 1:
+                weight = 1.0 + args.deep_weight * (li / (len(blocks) - 1))
+                loss_l = loss_l * weight
 
             loss_l.backward()
             # Optional grad clip per block and capture grad norm for debugging
@@ -896,12 +933,25 @@ def parse_args():
         default=1,
         help="number of negative candidates per sample (K)",
     )
+    p.add_argument(
+        "--negatives_final",
+        type=int,
+        default=None,
+        help="final number of negatives (linear ramp from --negatives)",
+    )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument(
         "--lr_final",
         type=float,
         default=None,
-        help="final learning rate for linear decay (defaults to no decay)",
+        help="final learning rate for decay (defaults to no decay)",
+    )
+    p.add_argument(
+        "--lr_decay_style",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine"],
+        help="learning rate decay schedule",
     )
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -912,7 +962,31 @@ def parse_args():
         "--noise_std",
         type=float,
         default=0.1,
-        help="std multiplier for gaussian noise negatives",
+        help="final std multiplier for gaussian noise negatives",
+    )
+    p.add_argument(
+        "--noise_std_start",
+        type=float,
+        default=None,
+        help="initial std for gaussian noise (defaults to --noise_std)",
+    )
+    p.add_argument(
+        "--noise_seq_prob",
+        type=float,
+        default=1.0,
+        help="final probability of including a pure noise sequence",
+    )
+    p.add_argument(
+        "--noise_seq_prob_start",
+        type=float,
+        default=0.0,
+        help="initial probability for pure noise sequence",
+    )
+    p.add_argument(
+        "--deep_weight",
+        type=float,
+        default=0.0,
+        help="additional loss weight toward deeper blocks",
     )
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--cpu", action="store_true", help="force CPU")
