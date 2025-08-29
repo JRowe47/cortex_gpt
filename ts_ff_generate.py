@@ -80,11 +80,12 @@ def ff_generate(
         else:
             cand = torch.randint(0, model.config.vocab_size, (B, num_candidates), device=device)
         next_tokens = []
+        K = cand.size(1)
         for b in range(B):
             ctx_b = ctx[b : b + 1, :]
             best_g = -1e9
             best_tok = 0
-            for k in range(num_candidates):
+            for k in range(K):
                 seq = torch.cat([ctx_b, cand[b : b + 1, k : k + 1]], dim=1)
                 inputs = snapshot_block_inputs(model, seq, blocks)
                 g_tot = 0.0

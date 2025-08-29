@@ -433,6 +433,8 @@ def train_ff(args):
     # include token embedding (shared when tie_weights=True)
     if hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
         head_params.extend(p for p in model.transformer.wte.parameters() if p.requires_grad)
+    if hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
+        head_params.extend(p for p in model.transformer.ln_f.parameters() if p.requires_grad)
     head_opt = (
         torch.optim.AdamW(head_params, lr=args.lr, weight_decay=args.weight_decay)
         if head_params
@@ -588,6 +590,9 @@ def train_ff(args):
             with torch.no_grad():
                 final_in = snapshot_block_inputs(model, pos_seq, blocks)[-1]
                 final_h = blocks[-1](final_in)
+            # apply final layer norm before the head for parity with eval path
+            if hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
+                final_h = model.transformer.ln_f(final_h)
             if hasattr(model, "lm_head_mfs"):
                 head_logp = model.lm_head_mfs(final_h, return_logprobs=True)
             else:
@@ -770,13 +775,14 @@ def ff_generate(
                 0, vocab_size, (B, num_candidates), device=device, dtype=torch.long
             )
         best_tokens = []
+        K = cand.size(1)
         for b in range(B):
             # ensure the true next token could be in the set if you want to test ground-truth scoring
             # For pure generation, we just sample K tokens.
             ctx_b = ctx[b : b + 1, :]  # [1, t]
             best_g = -1e9
             best_tok = 0
-            for k in range(num_candidates):
+            for k in range(K):
                 seq = torch.cat([ctx_b, cand[b : b + 1, k : k + 1]], dim=1)  # [1, t+1]
                 inputs_per_block = snapshot_block_inputs(model, seq, blocks)
                 # Aggregate goodness across all blocks for the final token
