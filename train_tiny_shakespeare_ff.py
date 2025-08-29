@@ -33,10 +33,26 @@ import time
 import random
 import argparse
 from typing import List, Tuple, Optional
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+@contextmanager
+def eval_no_grad(model: nn.Module):
+    """Temporarily switch a module to eval mode with gradients disabled."""
+    was_training = model.training
+    prev = torch.is_grad_enabled()
+    try:
+        model.eval()
+        torch.set_grad_enabled(False)
+        yield
+    finally:
+        torch.set_grad_enabled(prev)
+        if was_training:
+            model.train()
 
 # ---- Model import: try your two common entry points ----
 GPT = None
@@ -85,6 +101,11 @@ def load_bytes_dataset(data_dir: str) -> Tuple[torch.Tensor, torch.Tensor]:
     return train_data, val_data
 
 
+def to_logp(t: torch.Tensor, assume_logprobs: bool) -> torch.Tensor:
+    """Return log-probabilities given logits or log-probs input."""
+    return t if assume_logprobs else t.log_softmax(dim=-1)
+
+
 @torch.no_grad()
 def eval_lm(
     model: nn.Module,
@@ -93,6 +114,7 @@ def eval_lm(
     batch_size: int,
     steps: int,
     device: torch.device,
+    assume_logprobs: bool = False,
 ) -> Tuple[float, float]:
     """Return (negative log-likelihood, accuracy) for a byte dataset."""
     model.eval()
@@ -109,7 +131,7 @@ def eval_lm(
         x = torch.stack([data[i : i + block_size] for i in ix], dim=0)
         y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix], dim=0)
         logits, _ = model(x, targets=None)
-        logp = F.log_softmax(logits, dim=-1)
+        logp = to_logp(logits, assume_logprobs)
         V = logp.size(-1)
         nll = F.nll_loss(
             logp.view(-1, V), y.view(-1), ignore_index=-1, reduction="mean"
@@ -386,6 +408,13 @@ def renorm_incoming_weights(module: nn.Module, eps: float = 1e-8) -> None:
             p.data.copy_(w.view_as(p))
 
 
+def set_requires_grad(mods: List[nn.Module], flag: bool) -> None:
+    """Enable or disable gradients for a list of modules."""
+    for m in mods:
+        for p in m.parameters():
+            p.requires_grad_(flag)
+
+
 # ---------------------------
 # Training (FF)
 # ---------------------------
@@ -413,6 +442,18 @@ def train_ff(args):
     model.to(device)
     model.train()
 
+    # Detect whether head outputs logits or log-probs
+    with torch.no_grad():
+        probe = torch.randint(
+            0, 256, (1, min(8, args.block_size)), device=device
+        )
+        out, _ = model(probe, targets=None)
+        sumexp = out[0].exp().sum(dim=-1).mean().item()
+        assume_logprobs = abs(sumexp - 1.0) < 1e-3
+    print(
+        f"[head] assuming {'log-probs' if assume_logprobs else 'logits'} from the head"
+    )
+
     approx_M = num_params / 1e6
     print(f"Model params: {approx_M:.2f}M  (target ~{args.target_params_m:.1f}M)")
     if abs(approx_M - args.target_params_m) > 3.0:
@@ -424,6 +465,9 @@ def train_ff(args):
     # Extract residual blocks
     blocks = get_blocks(model)
     print(f"Found {len(blocks)} residual blocks for local FF updates.")
+
+    # EMA of negative goodness per layer for adaptive theta
+    theta_neg_ema = [args.theta for _ in blocks]
 
     # Per-layer optimizers
     opts = per_layer_optimizers(
@@ -509,15 +553,21 @@ def train_ff(args):
             else None
         )
 
-        # --- Capture *inputs* to each block for pos/neg/noise via one forward pass each ---
-        with torch.no_grad():
+        # --- Capture inputs to each block for pos/neg/noise ---
+        with eval_no_grad(model):
             pos_inputs_per_block = snapshot_block_inputs(model, pos_seq, blocks)
+
             if neg_seq is not None:
-                neg_inputs_per_block = snapshot_block_inputs(
-                    model, neg_seq[:, 0, :], blocks
+                B, K, T = neg_seq.shape
+                neg_flat = neg_seq.reshape(B * K, T)
+                neg_inputs_per_block_flat = snapshot_block_inputs(
+                    model, neg_flat, blocks
                 )
             else:
-                neg_inputs_per_block = None
+                B = pos_seq.size(0)
+                K = 0
+                neg_inputs_per_block_flat = None
+
             noise_inputs_per_block = (
                 snapshot_block_inputs(model, noise_seq, blocks)
                 if noise_seq is not None
@@ -538,6 +588,7 @@ def train_ff(args):
         layer_weight_norms = []
         layer_ff_losses = []
         layer_posneg_accs = []
+        layer_posneg_accs_max = []
 
         for li, blk in enumerate(blocks):
             opt = opts[li]
@@ -549,11 +600,12 @@ def train_ff(args):
                 layer_weight_norms.append(float("nan"))
                 layer_ff_losses.append(float("nan"))
                 layer_posneg_accs.append(float("nan"))
+                layer_posneg_accs_max.append(float("nan"))
                 continue
             opt.zero_grad(set_to_none=True)
 
             # Re-run THIS block on detached cached inputs so grads do not flow into earlier layers
-            x_pos_in = pos_inputs_per_block[li].detach().requires_grad_(True)
+            x_pos_in = pos_inputs_per_block[li].detach()
             y_pos = blk(x_pos_in)
             g_pos = layer_goodness(y_pos, token_index=-1)  # [B]
 
@@ -573,24 +625,45 @@ def train_ff(args):
             else:
                 g_noise_pure = None
 
-            if neg_inputs_per_block is not None:
-                x_neg_in = neg_inputs_per_block[li].detach().requires_grad_(True)
-                y_neg = blk(x_neg_in)
-                g_neg = layer_goodness(y_neg, token_index=-1)  # [B]
+            if neg_inputs_per_block_flat is not None and K > 0:
+                x_neg_in_flat = neg_inputs_per_block_flat[li].detach()
+                y_neg_flat = blk(x_neg_in_flat)
+                g_neg_flat = layer_goodness(y_neg_flat, token_index=-1)  # [B*K]
+                g_neg = g_neg_flat  # for logging of last block
 
-                # Build labels: +1 for pos, -1 for neg/noise, concat
-                parts = [g_pos]
-                labels = [torch.ones_like(g_pos)]
-                parts.append(g_neg)
-                labels.append(-torch.ones_like(g_neg))
-                if g_noise_gauss is not None:
-                    parts.append(g_noise_gauss)
-                    labels.append(-torch.ones_like(g_noise_gauss))
-                g_all = torch.cat(parts, dim=0)
-                y_lbl = torch.cat(labels, dim=0)
-                loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
-                acc = float((g_pos > g_neg).float().mean())
+                g_all = torch.cat([g_pos, g_neg_flat], dim=0)
+                y_lbl = torch.cat(
+                    [torch.ones_like(g_pos), -torch.ones_like(g_neg_flat)], dim=0
+                )
+
+                # Dynamic theta
+                theta_l = args.theta
+                if (
+                    args.theta_mode == "ema" and neg_inputs_per_block_flat is not None and K > 0
+                ):
+                    with torch.no_grad():
+                        theta_neg_ema[li] = (1.0 - args.theta_alpha) * theta_neg_ema[li] + \
+                            args.theta_alpha * float(g_neg_flat.mean())
+                    theta_l = theta_neg_ema[li] + args.theta_margin
+
+                if args.rebalance_pos and K > 0:
+                    w_pos = torch.full_like(g_pos, float(K))
+                    w_neg = torch.ones_like(g_neg_flat)
+                    weights = torch.cat([w_pos, w_neg], dim=0)
+                    loss_l = (
+                        F.softplus(-y_lbl * (g_all - theta_l)) * weights
+                    ).mean()
+                else:
+                    loss_l = ff_binary_loss(g_all, y_lbl, theta=theta_l)
+
+                g_neg_mean = g_neg_flat.view(B, K).mean(dim=1)
+                g_neg_max = g_neg_flat.view(B, K).max(dim=1).values
+                acc_mean = float((g_pos > g_neg_mean).float().mean())
+                acc_max = float((g_pos > g_neg_max).float().mean())
+                acc = acc_mean
             else:
+                theta_l = args.theta
+                g_neg = None
                 # Positive-only regularization toward a target goodness (rarely used)
                 if g_noise_gauss is not None:
                     g_all = torch.cat([g_pos, g_noise_gauss], dim=0)
@@ -598,12 +671,14 @@ def train_ff(args):
                         [torch.ones_like(g_pos), -torch.ones_like(g_noise_gauss)],
                         dim=0,
                     )
-                    loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
+                    loss_l = ff_binary_loss(g_all, y_lbl, theta=theta_l)
                     acc = float("nan")
+                    acc_max = float("nan")
                 else:
                     y_lbl = torch.ones_like(g_pos)
-                    loss_l = ff_binary_loss(g_pos, y_lbl, theta=args.theta)
+                    loss_l = ff_binary_loss(g_pos, y_lbl, theta=theta_l)
                     acc = float("nan")
+                    acc_max = float("nan")
 
             if args.deep_weight > 0 and len(blocks) > 1:
                 weight = 1.0 + args.deep_weight * (li / (len(blocks) - 1))
@@ -629,7 +704,11 @@ def train_ff(args):
             )
 
             layer_pos_means.append(float(g_pos.mean()))
-            layer_neg_means.append(float(g_neg.mean()) if g_neg is not None else float("nan"))
+            layer_neg_means.append(
+                float(g_neg_flat.mean())
+                if neg_inputs_per_block_flat is not None and K > 0
+                else float("nan")
+            )
             layer_noise_means.append(
                 float(g_noise_pure.mean()) if g_noise_pure is not None else float("nan")
             )
@@ -637,18 +716,16 @@ def train_ff(args):
             layer_weight_norms.append(w_norm)
             layer_ff_losses.append(float(loss_l.detach()))
             layer_posneg_accs.append(acc)
+            layer_posneg_accs_max.append(acc_max)
 
             total_loss_this_step += float(loss_l.detach())
 
         # --- Local cross-entropy update for LM head / embeddings ---
         if head_opt is not None:
+            set_requires_grad(blocks, False)
             head_opt.zero_grad(set_to_none=True)
-            # Run a standard forward pass so gradients flow into the
-            # token embedding and final block. Only the parameters in
-            # ``head_params`` (embedding + LM head) are stepped by
-            # ``head_opt`` below, leaving the FF-trained blocks untouched.
             logits, _ = model(pos_seq, targets=None)
-            logp = logits.log_softmax(dim=-1)
+            logp = to_logp(logits, assume_logprobs)
             V = logp.size(-1)
             logp = logp[:, :-1, :]
             target = pos_seq[:, 1:]
@@ -669,6 +746,7 @@ def train_ff(args):
                     )
                 )
             head_opt.step()
+            set_requires_grad(blocks, True)
             head_ce = float(ce_loss.detach())
             head_ppl = math.exp(head_ce)
             total_loss_this_step += head_ce
@@ -720,6 +798,8 @@ def train_ff(args):
                 + str([round(v, 3) for v in layer_ff_losses])
                 + " acc_pos>neg "
                 + str([round(v, 3) for v in layer_posneg_accs])
+                + " acc_pos>neg_max "
+                + str([round(v, 3) for v in layer_posneg_accs_max])
                 + " grad_norms "
                 + str([round(v, 3) for v in layer_grad_norms])
                 + " w_norms "
@@ -738,6 +818,7 @@ def train_ff(args):
                     args.batch_size,
                     steps=args.eval_batches,
                     device=device,
+                    assume_logprobs=assume_logprobs,
                 )
                 bpc = bpc_from_nll(val_lm)
                 ppl = ppl_from_nll(val_lm)
@@ -813,13 +894,41 @@ def train_ff(args):
     )
     print(f"Saved final model to {final_path}")
 
-    # Quick sample for sanity, using standard autoregressive generation
+    # Sample from the trained model with various settings
     model.eval()
-    ctx = torch.randint(0, 256, (1, min(64, args.block_size)), device=device)
-    out = model.generate(ctx, max_new_tokens=200, temperature=1.0, top_k=50)
-    sample = bytes(out[0].tolist()).decode("utf-8", errors="ignore")
-    print("\n=== Sample ===")
-    print(sample)
+    print("\n=== model.generate samples ===")
+    gen_settings = [
+        (0.7, 40),
+        (0.9, 50),
+        (1.1, 80),
+        (1.0, None),
+        (1.2, 100),
+    ]
+    for i, (temp, top_k) in enumerate(gen_settings, 1):
+        ctx = torch.randint(0, 256, (1, min(64, args.block_size)), device=device)
+        kwargs = {"temperature": temp}
+        if top_k is not None:
+            kwargs["top_k"] = top_k
+        out = model.generate(ctx, max_new_tokens=100, **kwargs)
+        sample = bytes(out[0].tolist()).decode("utf-8", errors="ignore")
+        print(f"[generate {i}] temp={temp} top_k={top_k} -> {sample}")
+
+    print("\n=== ff_scan samples ===")
+    scan_settings = [8, 6, 4, 3, 2]
+    for i, cand in enumerate(scan_settings, 1):
+        ctx = torch.randint(0, 256, (1, min(64, args.block_size)), device=device)
+        out = ff_generate(
+            model,
+            blocks,
+            ctx,
+            max_new_tokens=100,
+            block_size=args.block_size,
+            device=device,
+            theta=args.theta,
+            num_candidates=cand,
+        )
+        sample = bytes(out[0].tolist()).decode("utf-8", errors="ignore")
+        print(f"[ff_scan {i}] num_candidates={cand} -> {sample}")
 
 
 # ---------------------------
@@ -954,6 +1063,16 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument(
         "--theta", type=float, default=2.0, help="goodness threshold for logistic loss"
+    )
+    p.add_argument(
+        "--theta_mode", type=str, default="fixed", choices=["fixed", "ema"]
+    )
+    p.add_argument("--theta_margin", type=float, default=0.2)
+    p.add_argument("--theta_alpha", type=float, default=0.02)
+    p.add_argument(
+        "--rebalance_pos",
+        action="store_true",
+        help="weight positives by K in FF loss",
     )
     p.add_argument(
         "--noise_std",
