@@ -1,5 +1,4 @@
 import argparse
-from typing import Optional
 
 import torch
 from model import GPT, GPTConfig
@@ -70,12 +69,12 @@ def ff_generate(
     max_new_tokens,
     block_size,
     device,
-    num_candidates: Optional[int] = None,
+    num_candidates: int = 64,
 ):
     for _ in range(max_new_tokens):
         ctx = idx[:, -(block_size - 1) :] if idx.size(1) >= block_size else idx
         B = ctx.size(0)
-        if num_candidates is None or num_candidates >= model.config.vocab_size:
+        if num_candidates <= 0 or num_candidates >= model.config.vocab_size:
             cand = torch.arange(model.config.vocab_size, device=device).unsqueeze(0).repeat(B, 1)
         else:
             cand = torch.randint(0, model.config.vocab_size, (B, num_candidates), device=device)
@@ -111,8 +110,8 @@ def main():
     p.add_argument(
         "--scan_candidates",
         type=int,
-        default=256,
-        help="candidates per step for FF scan (default: evaluate all 256 tokens)",
+        default=64,
+        help="candidates per step for FF scan (0 or >= vocab to evaluate all tokens)",
     )
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--cpu", action="store_true", help="force CPU even if CUDA is available")

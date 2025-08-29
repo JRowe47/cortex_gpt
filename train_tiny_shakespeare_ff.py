@@ -496,6 +496,8 @@ def train_ff(args):
         layer_noise_means = []
         layer_grad_norms = []
         layer_weight_norms = []
+        layer_ff_losses = []
+        layer_posneg_accs = []
 
         for li, blk in enumerate(blocks):
             opt = opts[li]
@@ -504,6 +506,9 @@ def train_ff(args):
                 layer_neg_means.append(float("nan"))
                 layer_noise_means.append(float("nan"))
                 layer_grad_norms.append(0.0)
+                layer_weight_norms.append(float("nan"))
+                layer_ff_losses.append(float("nan"))
+                layer_posneg_accs.append(float("nan"))
                 continue
             opt.zero_grad(set_to_none=True)
 
@@ -541,6 +546,7 @@ def train_ff(args):
                 g_all = torch.cat(parts, dim=0)
                 y_lbl = torch.cat(labels, dim=0)
                 loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
+                acc = float((g_pos > g_neg).float().mean())
             else:
                 # Positive-only regularization toward a target goodness (rarely used)
                 if g_noise_gauss is not None:
@@ -550,9 +556,11 @@ def train_ff(args):
                         dim=0,
                     )
                     loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
+                    acc = float("nan")
                 else:
                     y_lbl = torch.ones_like(g_pos)
                     loss_l = ff_binary_loss(g_pos, y_lbl, theta=args.theta)
+                    acc = float("nan")
 
             loss_l.backward()
             # Optional grad clip per block and capture grad norm for debugging
@@ -581,6 +589,8 @@ def train_ff(args):
             )
             layer_grad_norms.append(grad_norm)
             layer_weight_norms.append(w_norm)
+            layer_ff_losses.append(float(loss_l.detach()))
+            layer_posneg_accs.append(acc)
 
             total_loss_this_step += float(loss_l.detach())
 
@@ -648,6 +658,10 @@ def train_ff(args):
                 + str([round(v, 3) for v in layer_neg_means])
                 + " layer_noise "
                 + str([round(v, 3) for v in layer_noise_means])
+                + " ff_loss "
+                + str([round(v, 3) for v in layer_ff_losses])
+                + " acc_pos>neg "
+                + str([round(v, 3) for v in layer_posneg_accs])
                 + " grad_norms "
                 + str([round(v, 3) for v in layer_grad_norms])
                 + " w_norms "
@@ -686,18 +700,27 @@ def train_ff(args):
                 vneg_inputs = snapshot_block_inputs(model, vneg[:, 0, :], blocks)
                 per_block = []
                 for li, blk in enumerate(blocks):
-                    vp = layer_goodness(blk(vpos_inputs[li]), token_index=-1).mean().item()
-                    vn = layer_goodness(blk(vneg_inputs[li]), token_index=-1).mean().item()
-                    per_block.append((vp, vn))
-                last_pos, last_neg = per_block[-1]
+                    vp_all = layer_goodness(blk(vpos_inputs[li]), token_index=-1)
+                    vn_all = layer_goodness(blk(vneg_inputs[li]), token_index=-1)
+                    vp = vp_all.mean().item()
+                    vn = vn_all.mean().item()
+                    acc = (vp_all > vn_all).float().mean().item()
+                    per_block.append((vp, vn, acc))
+                last_pos, last_neg, last_acc = per_block[-1]
                 print(
                     "[val probe] goodness per-block pos/neg: "
                     + " ".join(
-                        f"{i}:{p:.2f}/{n:.2f}" for i, (p, n) in enumerate(per_block)
+                        f"{i}:{p:.2f}/{n:.2f}" for i, (p, n, _) in enumerate(per_block)
                     )
                 )
                 print(
-                    f"[val probe] last-block gap: pos {last_pos:.3f}  neg {last_neg:.3f}  gap {last_pos - last_neg:.3f}"
+                    "[val probe] pos>neg acc: "
+                    + " ".join(
+                        f"{i}:{a:.2f}" for i, (_, _, a) in enumerate(per_block)
+                    )
+                )
+                print(
+                    f"[val probe] last-block gap: pos {last_pos:.3f}  neg {last_neg:.3f}  gap {last_pos - last_neg:.3f}  acc {last_acc:.3f}"
                 )
             model.train()
 
