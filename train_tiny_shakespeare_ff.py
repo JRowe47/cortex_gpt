@@ -93,11 +93,12 @@ def eval_lm(
     batch_size: int,
     steps: int,
     device: torch.device,
-) -> float:
-    """Simple LM NLL evaluation on a byte dataset."""
+) -> Tuple[float, float]:
+    """Return (negative log-likelihood, accuracy) for a byte dataset."""
     model.eval()
-    tot = 0.0
-    cnt = 0
+    tot_nll = 0.0
+    tot_tokens = 0
+    tot_correct = 0
     for _ in range(steps):
         max_start = len(data) - block_size - 1
         if max_start <= 0:
@@ -108,13 +109,18 @@ def eval_lm(
         x = torch.stack([data[i : i + block_size] for i in ix], dim=0)
         y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix], dim=0)
         logits, _ = model(x, targets=None)
-        V = logits.size(-1)
+        logp = F.log_softmax(logits, dim=-1)
+        V = logp.size(-1)
         nll = F.nll_loss(
-            logits.view(-1, V), y.view(-1), ignore_index=-1, reduction="mean"
+            logp.view(-1, V), y.view(-1), ignore_index=-1, reduction="mean"
         )
-        tot += float(nll)
-        cnt += 1
-    return tot / max(1, cnt)
+        preds = logp.argmax(dim=-1)
+        tot_correct += (preds == y).sum().item()
+        tot_tokens += y.numel()
+        tot_nll += float(nll)
+    avg_nll = tot_nll / max(1, steps)
+    acc = tot_correct / max(1, tot_tokens)
+    return avg_nll, acc
 
 
 def bpc_from_nll(nll: float) -> float:
@@ -492,6 +498,7 @@ def train_ff(args):
         head_ce = 0.0
         head_ppl = float("nan")
         head_grad_norm = 0.0
+        head_acc = float("nan")
         g_pos = g_neg = g_noise_gauss = g_noise_pure = None  # last block metrics
         layer_pos_means = []
         layer_neg_means = []
@@ -613,6 +620,8 @@ def train_ff(args):
             logp = head_logp[:, :-1, :]
             target = pos_seq[:, 1:]
             ce_loss = F.nll_loss(logp.reshape(-1, V), target.reshape(-1))
+            preds = logp.argmax(dim=-1)
+            head_acc = float((preds == target).float().mean().item())
             ce_loss.backward()
             if grad_clip is not None and grad_clip > 0:
                 head_grad_norm = float(
@@ -660,7 +669,7 @@ def train_ff(args):
             print(
                 f"step {step:6d}/{args.steps}  "
                 f"ff_loss {total_loss_this_step:.4f}  "
-                f"head_ce {head_ce:.4f}  head_ppl {head_ppl:.2f}  "
+                f"head_ce {head_ce:.4f}  head_ppl {head_ppl:.2f}  head_acc {head_acc:.3f}  "
                 f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  g_noise_seq {mean_noise_seq:.3f}  "
                 f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise_seq {ema_noise_g:.3f}  "
                 f"lr {cur_lr:.2e}  head_grad {head_grad_norm:.3f}  "
@@ -688,7 +697,7 @@ def train_ff(args):
             model.eval()
             with torch.no_grad():
                 # LM NLL / bpc / ppl
-                val_lm = eval_lm(
+                val_lm, val_acc = eval_lm(
                     model,
                     val_data,
                     args.block_size,
@@ -699,7 +708,7 @@ def train_ff(args):
                 bpc = bpc_from_nll(val_lm)
                 ppl = ppl_from_nll(val_lm)
                 print(
-                    f"[eval] step {step:6d}  val_lm_nll {val_lm:.4f}  bpc {bpc:.3f}  ppl {ppl:.2f}"
+                    f"[eval] step {step:6d}  val_lm_nll {val_lm:.4f}  bpc {bpc:.3f}  ppl {ppl:.2f}  acc {val_acc:.3f}"
                 )
 
                 # Optional goodness gap on val split
