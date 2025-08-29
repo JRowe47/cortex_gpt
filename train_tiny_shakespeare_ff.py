@@ -706,6 +706,7 @@ def train_ff(args):
                 f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  g_noise_seq {mean_noise_seq:.3f}  "
                 f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise_seq {ema_noise_g:.3f}  "
                 f"lr {cur_lr:.2e}  head_grad {head_grad_norm:.3f}  "
+                f"K {cur_negatives}  noise_p {cur_noise_prob:.2f}  "
                 f"({dt:.1f}s)"
             )
             print(
@@ -932,7 +933,7 @@ def parse_args():
     p.add_argument(
         "--negatives_final",
         type=int,
-        default=None,
+        default=4,
         help="final number of negatives (linear ramp from --negatives)",
     )
     p.add_argument("--lr", type=float, default=3e-4)
@@ -975,7 +976,7 @@ def parse_args():
     p.add_argument(
         "--noise_seq_prob_start",
         type=float,
-        default=0.0,
+        default=0.1,
         help="initial probability for pure noise sequence",
     )
     p.add_argument(
