@@ -71,6 +71,13 @@ def ff_generate(
     device,
     num_candidates: int = 64,
 ):
+    """Forward-Forward text generation by scanning candidate tokens.
+
+    Args:
+        num_candidates: number of tokens to score at each step. If ``num_candidates``
+            is ``<= 0`` or greater than the vocabulary size, the full vocabulary is
+            evaluated which is slow but exhaustive.
+    """
     for _ in range(max_new_tokens):
         ctx = idx[:, -(block_size - 1) :] if idx.size(1) >= block_size else idx
         B = ctx.size(0)
