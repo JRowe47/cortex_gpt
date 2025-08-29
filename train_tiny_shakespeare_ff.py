@@ -643,18 +643,14 @@ def train_ff(args):
         # --- Local cross-entropy update for LM head / embeddings ---
         if head_opt is not None:
             head_opt.zero_grad(set_to_none=True)
-            with torch.no_grad():
-                final_in = snapshot_block_inputs(model, pos_seq, blocks)[-1]
-                final_h = blocks[-1](final_in)
-            # apply final layer norm before the head for parity with eval path
-            if hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
-                final_h = model.transformer.ln_f(final_h)
-            if hasattr(model, "lm_head_mfs"):
-                head_logp = model.lm_head_mfs(final_h, return_logprobs=True)
-            else:
-                head_logp = model.lm_head(final_h).log_softmax(dim=-1)
-            V = head_logp.size(-1)
-            logp = head_logp[:, :-1, :]
+            # Run a standard forward pass so gradients flow into the
+            # token embedding and final block. Only the parameters in
+            # ``head_params`` (embedding + LM head) are stepped by
+            # ``head_opt`` below, leaving the FF-trained blocks untouched.
+            logits, _ = model(pos_seq, targets=None)
+            logp = logits.log_softmax(dim=-1)
+            V = logp.size(-1)
+            logp = logp[:, :-1, :]
             target = pos_seq[:, 1:]
             ce_loss = F.nll_loss(logp.reshape(-1, V), target.reshape(-1))
             preds = logp.argmax(dim=-1)
