@@ -1,4 +1,5 @@
 import argparse
+
 import torch
 from model import GPT, GPTConfig
 
@@ -68,18 +69,29 @@ def ff_generate(
     max_new_tokens,
     block_size,
     device,
-    num_candidates=64,
+    num_candidates: int = 64,
 ):
+    """Forward-Forward text generation by scanning candidate tokens.
+
+    Args:
+        num_candidates: number of tokens to score at each step. If ``num_candidates``
+            is ``<= 0`` or greater than the vocabulary size, the full vocabulary is
+            evaluated which is slow but exhaustive.
+    """
     for _ in range(max_new_tokens):
         ctx = idx[:, -(block_size - 1) :] if idx.size(1) >= block_size else idx
         B = ctx.size(0)
-        cand = torch.randint(0, model.config.vocab_size, (B, num_candidates), device=device)
+        if num_candidates <= 0 or num_candidates >= model.config.vocab_size:
+            cand = torch.arange(model.config.vocab_size, device=device).unsqueeze(0).repeat(B, 1)
+        else:
+            cand = torch.randint(0, model.config.vocab_size, (B, num_candidates), device=device)
         next_tokens = []
+        K = cand.size(1)
         for b in range(B):
             ctx_b = ctx[b : b + 1, :]
             best_g = -1e9
             best_tok = 0
-            for k in range(num_candidates):
+            for k in range(K):
                 seq = torch.cat([ctx_b, cand[b : b + 1, k : k + 1]], dim=1)
                 inputs = snapshot_block_inputs(model, seq, blocks)
                 g_tot = 0.0
@@ -102,7 +114,12 @@ def main():
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--ff_scan", action="store_true", help="use slow FF scanning instead of model.generate")
-    p.add_argument("--scan_candidates", type=int, default=64, help="candidates per step for FF scan")
+    p.add_argument(
+        "--scan_candidates",
+        type=int,
+        default=64,
+        help="candidates per step for FF scan (0 or >= vocab to evaluate all tokens)",
+    )
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--cpu", action="store_true", help="force CPU even if CUDA is available")
     args = p.parse_args()

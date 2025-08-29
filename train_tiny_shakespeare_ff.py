@@ -93,11 +93,12 @@ def eval_lm(
     batch_size: int,
     steps: int,
     device: torch.device,
-) -> float:
-    """Simple LM NLL evaluation on a byte dataset."""
+) -> Tuple[float, float]:
+    """Return (negative log-likelihood, accuracy) for a byte dataset."""
     model.eval()
-    tot = 0.0
-    cnt = 0
+    tot_nll = 0.0
+    tot_tokens = 0
+    tot_correct = 0
     for _ in range(steps):
         max_start = len(data) - block_size - 1
         if max_start <= 0:
@@ -108,13 +109,18 @@ def eval_lm(
         x = torch.stack([data[i : i + block_size] for i in ix], dim=0)
         y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix], dim=0)
         logits, _ = model(x, targets=None)
-        V = logits.size(-1)
+        logp = F.log_softmax(logits, dim=-1)
+        V = logp.size(-1)
         nll = F.nll_loss(
-            logits.view(-1, V), y.view(-1), ignore_index=-1, reduction="mean"
+            logp.view(-1, V), y.view(-1), ignore_index=-1, reduction="mean"
         )
-        tot += float(nll)
-        cnt += 1
-    return tot / max(1, cnt)
+        preds = logp.argmax(dim=-1)
+        tot_correct += (preds == y).sum().item()
+        tot_tokens += y.numel()
+        tot_nll += float(nll)
+    avg_nll = tot_nll / max(1, steps)
+    acc = tot_correct / max(1, tot_tokens)
+    return avg_nll, acc
 
 
 def bpc_from_nll(nll: float) -> float:
@@ -365,6 +371,21 @@ def per_layer_optimizers(
     return opts
 
 
+def renorm_incoming_weights(module: nn.Module, eps: float = 1e-8) -> None:
+    """Renormalize each neuron's incoming weight vector to unit norm.
+
+    This follows Hinton's FF recommendation to keep activations bounded and
+    helps monitor when a layer's weights start to explode. We apply it after
+    each local optimizer step.
+    """
+    for p in module.parameters():
+        if p.ndim >= 2:
+            w = p.data.view(p.size(0), -1)
+            norms = w.norm(dim=1, keepdim=True).clamp(min=eps)
+            w.div_(norms)
+            p.data.copy_(w.view_as(p))
+
+
 # ---------------------------
 # Training (FF)
 # ---------------------------
@@ -418,6 +439,8 @@ def train_ff(args):
     # include token embedding (shared when tie_weights=True)
     if hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
         head_params.extend(p for p in model.transformer.wte.parameters() if p.requires_grad)
+    if hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
+        head_params.extend(p for p in model.transformer.ln_f.parameters() if p.requires_grad)
     head_opt = (
         torch.optim.AdamW(head_params, lr=args.lr, weight_decay=args.weight_decay)
         if head_params
@@ -435,6 +458,19 @@ def train_ff(args):
     ema_noise_g = None
 
     for step in range(1, args.steps + 1):
+        # optional linear LR decay
+        cur_lr = args.lr
+        if args.lr_final is not None:
+            t = (step - 1) / max(1, args.steps - 1)
+            cur_lr = args.lr + t * (args.lr_final - args.lr)
+            for opt in opts:
+                if opt is not None:
+                    for pg in opt.param_groups:
+                        pg["lr"] = cur_lr
+            if head_opt is not None:
+                for pg in head_opt.param_groups:
+                    pg["lr"] = cur_lr
+
         # --- Build a minibatch of positive and negative sequences ---
         pos_seq, neg_seq = get_batch_bytes(
             train_data,
@@ -461,11 +497,17 @@ def train_ff(args):
         # --- Per-layer local FF update ---
         total_loss_this_step = 0.0
         head_ce = 0.0
+        head_ppl = float("nan")
+        head_grad_norm = 0.0
+        head_acc = float("nan")
         g_pos = g_neg = g_noise_gauss = g_noise_pure = None  # last block metrics
         layer_pos_means = []
         layer_neg_means = []
         layer_noise_means = []
         layer_grad_norms = []
+        layer_weight_norms = []
+        layer_ff_losses = []
+        layer_posneg_accs = []
 
         for li, blk in enumerate(blocks):
             opt = opts[li]
@@ -474,6 +516,9 @@ def train_ff(args):
                 layer_neg_means.append(float("nan"))
                 layer_noise_means.append(float("nan"))
                 layer_grad_norms.append(0.0)
+                layer_weight_norms.append(float("nan"))
+                layer_ff_losses.append(float("nan"))
+                layer_posneg_accs.append(float("nan"))
                 continue
             opt.zero_grad(set_to_none=True)
 
@@ -511,6 +556,7 @@ def train_ff(args):
                 g_all = torch.cat(parts, dim=0)
                 y_lbl = torch.cat(labels, dim=0)
                 loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
+                acc = float((g_pos > g_neg).float().mean())
             else:
                 # Positive-only regularization toward a target goodness (rarely used)
                 if g_noise_gauss is not None:
@@ -520,9 +566,11 @@ def train_ff(args):
                         dim=0,
                     )
                     loss_l = ff_binary_loss(g_all, y_lbl, theta=args.theta)
+                    acc = float("nan")
                 else:
                     y_lbl = torch.ones_like(g_pos)
                     loss_l = ff_binary_loss(g_pos, y_lbl, theta=args.theta)
+                    acc = float("nan")
 
             loss_l.backward()
             # Optional grad clip per block and capture grad norm for debugging
@@ -537,6 +585,11 @@ def train_ff(args):
                     )
                 )
             opt.step()
+            if args.renorm:
+                renorm_incoming_weights(blk)
+            w_norm = math.sqrt(
+                sum(p.detach().pow(2).sum().item() for p in blk.parameters())
+            )
 
             layer_pos_means.append(float(g_pos.mean()))
             layer_neg_means.append(float(g_neg.mean()) if g_neg is not None else float("nan"))
@@ -544,6 +597,9 @@ def train_ff(args):
                 float(g_noise_pure.mean()) if g_noise_pure is not None else float("nan")
             )
             layer_grad_norms.append(grad_norm)
+            layer_weight_norms.append(w_norm)
+            layer_ff_losses.append(float(loss_l.detach()))
+            layer_posneg_accs.append(acc)
 
             total_loss_this_step += float(loss_l.detach())
 
@@ -553,17 +609,35 @@ def train_ff(args):
             with torch.no_grad():
                 final_in = snapshot_block_inputs(model, pos_seq, blocks)[-1]
                 final_h = blocks[-1](final_in)
+            # apply final layer norm before the head for parity with eval path
+            if hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
+                final_h = model.transformer.ln_f(final_h)
             if hasattr(model, "lm_head_mfs"):
                 head_logp = model.lm_head_mfs(final_h, return_logprobs=True)
             else:
                 head_logp = model.lm_head(final_h).log_softmax(dim=-1)
-            target = pos_seq[:, -1]
-            ce_loss = F.nll_loss(head_logp[:, -1, :], target)
+            V = head_logp.size(-1)
+            logp = head_logp[:, :-1, :]
+            target = pos_seq[:, 1:]
+            ce_loss = F.nll_loss(logp.reshape(-1, V), target.reshape(-1))
+            preds = logp.argmax(dim=-1)
+            head_acc = float((preds == target).float().mean().item())
             ce_loss.backward()
             if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(head_params, grad_clip)
+                head_grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(head_params, grad_clip)
+                )
+            else:
+                head_grad_norm = math.sqrt(
+                    sum(
+                        (p.grad.detach().pow(2).sum().item())
+                        for p in head_params
+                        if p.grad is not None
+                    )
+                )
             head_opt.step()
             head_ce = float(ce_loss.detach())
+            head_ppl = math.exp(head_ce)
             total_loss_this_step += head_ce
 
         # --- Simple metrics/logging ---
@@ -595,9 +669,10 @@ def train_ff(args):
             print(
                 f"step {step:6d}/{args.steps}  "
                 f"ff_loss {total_loss_this_step:.4f}  "
-                f"head_ce {head_ce:.4f}  "
+                f"head_ce {head_ce:.4f}  head_ppl {head_ppl:.2f}  head_acc {head_acc:.3f}  "
                 f"g_pos {mean_pos:.3f}  g_neg {mean_neg:.3f}  g_noise {mean_noise:.3f}  g_noise_seq {mean_noise_seq:.3f}  "
                 f"ema_pos {ema_pos_g:.3f}  ema_neg {ema_neg_g:.3f}  ema_noise_seq {ema_noise_g:.3f}  "
+                f"lr {cur_lr:.2e}  head_grad {head_grad_norm:.3f}  "
                 f"({dt:.1f}s)"
             )
             print(
@@ -607,8 +682,14 @@ def train_ff(args):
                 + str([round(v, 3) for v in layer_neg_means])
                 + " layer_noise "
                 + str([round(v, 3) for v in layer_noise_means])
+                + " ff_loss "
+                + str([round(v, 3) for v in layer_ff_losses])
+                + " acc_pos>neg "
+                + str([round(v, 3) for v in layer_posneg_accs])
                 + " grad_norms "
                 + str([round(v, 3) for v in layer_grad_norms])
+                + " w_norms "
+                + str([round(v, 3) for v in layer_weight_norms])
             )
 
         # Evaluation: goodness probe + LM metrics for parity with backprop run
@@ -616,7 +697,7 @@ def train_ff(args):
             model.eval()
             with torch.no_grad():
                 # LM NLL / bpc / ppl
-                val_lm = eval_lm(
+                val_lm, val_acc = eval_lm(
                     model,
                     val_data,
                     args.block_size,
@@ -627,7 +708,7 @@ def train_ff(args):
                 bpc = bpc_from_nll(val_lm)
                 ppl = ppl_from_nll(val_lm)
                 print(
-                    f"[eval] step {step:6d}  val_lm_nll {val_lm:.4f}  bpc {bpc:.3f}  ppl {ppl:.2f}"
+                    f"[eval] step {step:6d}  val_lm_nll {val_lm:.4f}  bpc {bpc:.3f}  ppl {ppl:.2f}  acc {val_acc:.3f}"
                 )
 
                 # Optional goodness gap on val split
@@ -643,18 +724,27 @@ def train_ff(args):
                 vneg_inputs = snapshot_block_inputs(model, vneg[:, 0, :], blocks)
                 per_block = []
                 for li, blk in enumerate(blocks):
-                    vp = layer_goodness(blk(vpos_inputs[li]), token_index=-1).mean().item()
-                    vn = layer_goodness(blk(vneg_inputs[li]), token_index=-1).mean().item()
-                    per_block.append((vp, vn))
-                last_pos, last_neg = per_block[-1]
+                    vp_all = layer_goodness(blk(vpos_inputs[li]), token_index=-1)
+                    vn_all = layer_goodness(blk(vneg_inputs[li]), token_index=-1)
+                    vp = vp_all.mean().item()
+                    vn = vn_all.mean().item()
+                    acc = (vp_all > vn_all).float().mean().item()
+                    per_block.append((vp, vn, acc))
+                last_pos, last_neg, last_acc = per_block[-1]
                 print(
                     "[val probe] goodness per-block pos/neg: "
                     + " ".join(
-                        f"{i}:{p:.2f}/{n:.2f}" for i, (p, n) in enumerate(per_block)
+                        f"{i}:{p:.2f}/{n:.2f}" for i, (p, n, _) in enumerate(per_block)
                     )
                 )
                 print(
-                    f"[val probe] last-block gap: pos {last_pos:.3f}  neg {last_neg:.3f}  gap {last_pos - last_neg:.3f}"
+                    "[val probe] pos>neg acc: "
+                    + " ".join(
+                        f"{i}:{a:.2f}" for i, (_, _, a) in enumerate(per_block)
+                    )
+                )
+                print(
+                    f"[val probe] last-block gap: pos {last_pos:.3f}  neg {last_neg:.3f}  gap {last_pos - last_neg:.3f}  acc {last_acc:.3f}"
                 )
             model.train()
 
@@ -713,31 +803,32 @@ def ff_generate(
     device: torch.device,
     vocab_size: int = 256,
     theta: float = 2.0,
-    num_candidates: int = 64,
+    num_candidates: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Slow FF generation: at each step, try a subset of candidate next tokens and pick the one
-    with the highest aggregated goodness across blocks.
+    Slow FF generation: at each step, score candidate next tokens and pick the
+    one with the highest aggregated goodness across blocks. If `num_candidates`
+    is None or >= vocab_size, all tokens in the vocabulary are evaluated.
     """
     model.eval()
     for _ in range(max_new_tokens):
         ctx = idx[:, -(block_size - 1) :] if idx.size(1) >= block_size else idx
         B = ctx.size(0)
-        # Sample candidate tokens to score (for speed). You can also brute-force 0..255.
-        cand = torch.randint(
-            0, vocab_size, (B, num_candidates), device=device, dtype=torch.long
-        )  # [B, K]
+        if num_candidates is None or num_candidates >= vocab_size:
+            cand = torch.arange(vocab_size, device=device).unsqueeze(0).repeat(B, 1)
+        else:
+            cand = torch.randint(
+                0, vocab_size, (B, num_candidates), device=device, dtype=torch.long
+            )
         best_tokens = []
+        K = cand.size(1)
         for b in range(B):
-            # ensure the true next token could be in the set if you want to test ground-truth scoring
-            # For pure generation, we just sample K tokens.
             ctx_b = ctx[b : b + 1, :]  # [1, t]
             best_g = -1e9
             best_tok = 0
-            for k in range(num_candidates):
+            for k in range(K):
                 seq = torch.cat([ctx_b, cand[b : b + 1, k : k + 1]], dim=1)  # [1, t+1]
                 inputs_per_block = snapshot_block_inputs(model, seq, blocks)
-                # Aggregate goodness across all blocks for the final token
                 g_total = 0.0
                 for li, blk in enumerate(blocks):
                     out = blk(inputs_per_block[li])
@@ -806,6 +897,12 @@ def parse_args():
         help="number of negative candidates per sample (K)",
     )
     p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--lr_final",
+        type=float,
+        default=None,
+        help="final learning rate for linear decay (defaults to no decay)",
+    )
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument(
@@ -824,6 +921,13 @@ def parse_args():
     p.add_argument("--n_head", type=int, default=6)
     p.add_argument("--n_embd", type=int, default=384)
     p.add_argument("--target_params_m", type=float, default=15.0)
+    p.add_argument(
+        "--no_renorm",
+        action="store_false",
+        dest="renorm",
+        help="disable weight renormalization after each block update",
+    )
+    p.set_defaults(renorm=True)
     return p.parse_args()
 
 
