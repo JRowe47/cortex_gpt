@@ -94,9 +94,10 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
 # --------------------
 model.train()
 num_steps = 1000
-print_interval = 50
+print_interval = 10
 eval_interval = 200
 running_loss = 0.0
+print("step,avg_train_loss,val_loss,val_ppl")
 
 for step in range(1, num_steps + 1):
     x_batch, y_batch = get_batch("train", batch_size, block_size)
@@ -128,40 +129,41 @@ for step in range(1, num_steps + 1):
 
     running_loss += loss.item()
     if step % print_interval == 0:
-        print(f"Step {step}: avg training loss = {running_loss / print_interval:.4f}")
+        avg_train_loss = running_loss / print_interval
         running_loss = 0.0
-
-    if step % eval_interval == 0:
-        model.eval()
-        with torch.no_grad():
-            val_batches = 10
-            val_loss_total = 0.0
-            for _ in range(val_batches):
-                x_val, y_val = get_batch("val", batch_size, block_size)
-                x_val = x_val.to(device)
-                y_val = y_val.to(device)
-                for region in model.regions:
-                    region.state.reset_state(batch_size, device)
-                    region.kv.ptr.zero_()
-                    region.kv.keys.zero_()
-                    region.kv.vals.zero_()
-                model._neighbor_msg_prev = None
-                x_emb_val, _ = sensor(x_val)
-                batch_loss = 0.0
-                for t in range(block_size):
-                    x_val_t = x_emb_val[:, t, :]
-                    x_per_region = torch.zeros(R, batch_size, d_model, device=device)
-                    x_per_region[io_idxs["sensor"]] = x_val_t
-                    target_val_t = y_val[:, t]
-                    _, loss_val_t, _ = model(x_per_region, targets=target_val_t)
-                    batch_loss += loss_val_t.item()
-                val_loss_total += batch_loss / block_size
-            val_loss = val_loss_total / val_batches
-            val_ppl = math.exp(val_loss)
-        print(
-            f"Validation: avg loss = {val_loss:.4f}, perplexity = {val_ppl:.2f}"
-        )
-        model.train()
+        val_loss = ""
+        val_ppl = ""
+        if step % eval_interval == 0:
+            model.eval()
+            with torch.no_grad():
+                val_batches = 10
+                val_loss_total = 0.0
+                for _ in range(val_batches):
+                    x_val, y_val = get_batch("val", batch_size, block_size)
+                    x_val = x_val.to(device)
+                    y_val = y_val.to(device)
+                    for region in model.regions:
+                        region.state.reset_state(batch_size, device)
+                        region.kv.ptr.zero_()
+                        region.kv.keys.zero_()
+                        region.kv.vals.zero_()
+                    model._neighbor_msg_prev = None
+                    x_emb_val, _ = sensor(x_val)
+                    batch_loss = 0.0
+                    for t in range(block_size):
+                        x_val_t = x_emb_val[:, t, :]
+                        x_per_region = torch.zeros(R, batch_size, d_model, device=device)
+                        x_per_region[io_idxs["sensor"]] = x_val_t
+                        target_val_t = y_val[:, t]
+                        _, loss_val_t, _ = model(x_per_region, targets=target_val_t)
+                        batch_loss += loss_val_t.item()
+                    val_loss_total += batch_loss / block_size
+                val_loss = val_loss_total / val_batches
+                val_ppl = math.exp(val_loss)
+            model.train()
+            print(f"{step},{avg_train_loss:.4f},{val_loss:.4f},{val_ppl:.2f}")
+        else:
+            print(f"{step},{avg_train_loss:.4f},{val_loss},{val_ppl}")
 
 
 # --------------------
