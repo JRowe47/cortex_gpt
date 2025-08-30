@@ -158,6 +158,12 @@ def test_cortex_minimal():
     x_per_region[io_idxs['sensor']] = torch.randn(B, d_model)
     targets = torch.randint(0, vocab_size, (B,))
 
+    # Inference path should return a loss of None
+    logp, loss, aux = model(x_per_region)
+    assert logp.shape == (B, vocab_size)
+    assert loss is None
+
+    # Training path with targets should produce a finite loss
     logp, loss, aux = model(x_per_region, targets=targets)
     assert logp.shape == (B, vocab_size)
     assert loss is not None

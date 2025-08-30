@@ -127,7 +127,12 @@ class CortexModel(nn.Module):
         motor_state = self.motor_proj(H2[motor_idx])
         if motor_state.dim() == 3:
             motor_state = motor_state.mean(dim=0)
-        logp, loss, mfs_aux = self.mfs(motor_state, targets=targets)
+        mfs_out = self.mfs(motor_state, targets=targets)
+        if targets is not None:
+            logp, loss, mfs_aux = mfs_out
+        else:
+            logp, mfs_aux = mfs_out
+            loss = None
 
         # 5) Surprise/aha -> build broadcast messages
         if targets is not None:
