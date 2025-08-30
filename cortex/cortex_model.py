@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List
 
-from cortex.statecell import StateCell
+from cortex.multitau import MultiTauState, RegionMemoryKV
 from cortex.facet_broadcast import FacetResidualEmitter, BroadcastRouter
 from cortex.surprise_aha import SurpriseMeter, AhaDiffuser, BurstBudget
 from cortex.region_sparsity_gate import RegionSparsityGate
@@ -15,23 +15,30 @@ from mfs import MultiFacetSoftmax
 from sparse_routing import SparseMessagePassing
 
 class Region(nn.Module):
-    def __init__(self, d_model: int, n_slots: int = 8):
+    """Region with multi-timescale state and pose-aware heads."""
+
+    def __init__(self, d_model: int, d_pose: int = 12, memory_cap: int = 128):
         super().__init__()
         self.ff = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
             nn.Linear(4 * d_model, d_model)
         )
-        self.state = StateCell(d_model, n_slots=n_slots)
+        self.state = MultiTauState(d_model)
+        self.pose_head = nn.Linear(d_model, d_pose)
+        self.predictor = nn.Linear(d_model, d_model)
+        self.kv = RegionMemoryKV(memory_cap, key_dim=d_model, val_dim=d_model)
 
     def forward(self, x: torch.Tensor, neighbor_msg: torch.Tensor | None = None, alpha_boost: float = 1.0):
-        """
-        x: [B, D], neighbor_msg: [B, D] or None
-        Returns: [B, D], aux
-        """
+        """x: [B,D]; neighbor_msg: [B,D] or None"""
+        if neighbor_msg is None:
+            neighbor_msg = torch.zeros_like(x)
         h = self.ff(x)
-        s_read, saux = self.state(h, neighbor_msg=neighbor_msg, alpha_boost=alpha_boost)
-        return h + s_read, saux
+        s = self.state(h + neighbor_msg)
+        pose = self.pose_head(s)
+        pred = self.predictor(s)
+        aux = {'pose': pose.detach(), 'pred': pred.detach()}
+        return h + s, aux
 
 
 class CortexModel(nn.Module):
@@ -52,7 +59,6 @@ class CortexModel(nn.Module):
                  num_facets: int = 7,
                  top_m_facets: int = 2,
                  k_active: int = 6,
-                 n_slots: int = 8,
                  router_top_k: int = 4):
         super().__init__()
         self.R = R
@@ -60,7 +66,7 @@ class CortexModel(nn.Module):
         self.neighbor_indices = neighbor_indices
         self.io_idxs = io_idxs
 
-        self.regions = nn.ModuleList([Region(d_model, n_slots=n_slots) for _ in range(R)])
+        self.regions = nn.ModuleList([Region(d_model) for _ in range(R)])
 
         # Sparse router among regions
         self.router = SparseMessagePassing(d_model, top_k_neighbors=router_top_k)

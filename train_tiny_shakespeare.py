@@ -88,7 +88,6 @@ def build_cortex_and_inputs(vocab_size: int,
                         num_facets=num_facets,
                         top_m_facets=top_m_facets,
                         k_active=k_active,
-                        n_slots=8,
                         router_top_k=router_top_k).to(device)
 
     sensor = TextSensor(vocab_size=vocab_size, d_model=d_model, ctx_len=128, tie_embedding=True).to(device)
