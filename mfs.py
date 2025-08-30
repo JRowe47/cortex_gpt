@@ -47,9 +47,10 @@ class MultiFacetSoftmax(nn.Module):
         h: [B, D] or [B, T, D]
         targets: optional [B] or [B, T] token ids for CE loss
         Returns:
-          If targets is None: (logp, aux)
-          Else: (logp, loss, aux)
-          where logp is log-prob over vocab with mixture, shape [B, V] or [B, T, V]
+          (logp, loss, aux)
+          where ``loss`` is ``None`` when ``targets`` is ``None`` and ``logp`` is
+          the log-probability over the vocabulary with the mixture, shape
+          ``[B, V]`` or ``[B, T, V]``
         """
         squeezed = (h.dim() == 2)
         if squeezed:
@@ -89,13 +90,23 @@ class MultiFacetSoftmax(nn.Module):
         loss = None
         if targets is not None:
             targets = targets if targets.dim() == 2 else targets.unsqueeze(1)  # [B, T]
-            nll = F.nll_loss(logp.reshape(-1, logp.size(-1)), targets.reshape(-1), reduction='mean')
-            loss = nll + self.entropy_coef * aux['gate_entropy'] + self.balance_coef * aux['load_balance']
+            nll = F.nll_loss(
+                logp.reshape(-1, logp.size(-1)),
+                targets.reshape(-1),
+                reduction='mean',
+            )
+            loss = (
+                nll
+                + self.entropy_coef * aux['gate_entropy']
+                + self.balance_coef * aux['load_balance']
+            )
 
         if squeezed:
             logp = logp.squeeze(1)
 
-        return (logp, loss, aux) if targets is not None else (logp, aux)
+        # Always return three outputs for API consistency; ``loss`` will be
+        # ``None`` when targets are not provided.
+        return logp, loss, aux
 
 
 class MFSHead(nn.Module):
@@ -144,7 +155,7 @@ class MFSHead(nn.Module):
         # Temporarily override the temperature of the wrapped head.
         prev_temp = self.mfs.temperature
         self.mfs.temperature = temperature
-        logp, _ = self.mfs(h)
+        logp, _, _ = self.mfs(h)
         self.mfs.temperature = prev_temp
 
         if return_logprobs:
