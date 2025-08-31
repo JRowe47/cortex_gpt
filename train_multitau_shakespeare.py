@@ -5,7 +5,7 @@ import torch
 from cortex.cortex_model import CortexModel
 from cortex.io_patches import TextSensor
 from cortex.hexgrid import make_grid, build_adjacency
-from lion_pytorch import Lion
+from torch.optim import Adam
 
 
 # --------------------
@@ -87,10 +87,8 @@ sensor = TextSensor(
 for f in model.mfs.facets:
     f.weight = sensor.emb.weight
 
-if torch.cuda.is_available():
-    model = torch.compile(model, mode="max-autotune")
-
-optimizer = Lion(model.parameters(), lr=1.5e-4, betas=(0.9, 0.99), weight_decay=1e-2)
+# Using the standard Adam optimizer instead of Lion to avoid extra dependencies
+optimizer = Adam(model.parameters(), lr=1.5e-4, betas=(0.9, 0.99), weight_decay=1e-2)
 
 num_steps = 1000
 warmup_steps = 50
