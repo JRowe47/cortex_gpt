@@ -1,16 +1,31 @@
 # cortex/cortex_model.py
 # Integrated neocortical sensorimotor recurrent system with sparsity, UFD, and surprise.
 
+"""Core cortical model components.
+
+The original implementation used absolute imports (e.g. ``from cortex.foo``)
+for modules that live alongside this file inside the ``cortex`` package.  When
+``cortex.cortex_model`` was imported while the package was only partially
+initialised, Python would attempt to resolve those absolute imports by
+re-importing the ``cortex`` package.  In some environments this manifested as a
+spurious circular import where ``cortex.cortex_model`` ended up importing
+itself.
+
+Using explicit relative imports keeps the resolution within the local package
+scope and avoids re-triggering the package import machinery, eliminating the
+false circular dependency.
+"""
+
 from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List
 
-from cortex.multitau import MultiTauState, RegionMemoryKV
-from cortex.facet_broadcast import FacetResidualEmitter, BroadcastRouter
-from cortex.surprise_aha import SurpriseMeter, AhaDiffuser, BurstBudget
-from cortex.region_sparsity_gate import RegionSparsityGate
+from .multitau import MultiTauState, RegionMemoryKV
+from .facet_broadcast import FacetResidualEmitter, BroadcastRouter
+from .surprise_aha import SurpriseMeter, AhaDiffuser, BurstBudget
+from .region_sparsity_gate import RegionSparsityGate
 from mfs import MultiFacetSoftmax
 from sparse_routing import SparseMessagePassing
 from ff import KWTA
