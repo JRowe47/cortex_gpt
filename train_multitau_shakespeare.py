@@ -5,6 +5,7 @@ import torch
 from cortex.cortex_model import CortexModel
 from cortex.io_patches import TextSensor
 from cortex.hexgrid import make_grid, build_adjacency
+from lion_pytorch import Lion
 
 
 # --------------------
@@ -86,20 +87,36 @@ sensor = TextSensor(
 for f in model.mfs.facets:
     f.weight = sensor.emb.weight
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
+if torch.cuda.is_available():
+    model = torch.compile(model, mode="max-autotune")
+
+optimizer = Lion(model.parameters(), lr=1.5e-4, betas=(0.9, 0.99), weight_decay=1e-2)
+
+num_steps = 1000
+warmup_steps = 50
+def lr_lambda(it):
+    if it < warmup_steps:
+        return float(it + 1) / warmup_steps
+    progress = (it - warmup_steps) / max(1, num_steps - warmup_steps)
+    return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # --------------------
 # Training Loop
 # --------------------
 model.train()
-num_steps = 1000
 print_interval = 10
 eval_interval = 200
 running_loss = 0.0
 print("step,avg_train_loss,val_loss,val_ppl")
 
 for step in range(1, num_steps + 1):
+    # anneal k_active from dense -> sparse
+    k0, kT, T = R, max(2, R // 8), 2000
+    model.gate.k_active = max(kT, int(k0 - (k0 - kT) * min(1.0, step / T)))
+
     x_batch, y_batch = get_batch("train", batch_size, block_size)
     x_batch = x_batch.to(device)
     y_batch = y_batch.to(device)
@@ -126,6 +143,7 @@ for step in range(1, num_steps + 1):
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
+    scheduler.step()
 
     running_loss += loss.item()
     if step % print_interval == 0:

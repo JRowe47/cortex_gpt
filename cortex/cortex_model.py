@@ -13,31 +13,62 @@ from cortex.surprise_aha import SurpriseMeter, AhaDiffuser, BurstBudget
 from cortex.region_sparsity_gate import RegionSparsityGate
 from mfs import MultiFacetSoftmax
 from sparse_routing import SparseMessagePassing
+from ff import KWTA
+
+
+class RMSNorm(nn.Module):
+    """Root-Mean-Square LayerNorm without mean subtraction."""
+
+    def __init__(self, d: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = x.norm(dim=-1, keepdim=True) * (x.shape[-1] ** -0.5)
+        return self.weight * (x / (norm + self.eps))
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU feedforward with expansion."""
+
+    def __init__(self, d: int, expansion: int = 2):
+        super().__init__()
+        self.up = nn.Linear(d, expansion * d * 2, bias=False)
+        self.down = nn.Linear(expansion * d, d, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = self.up(x).chunk(2, dim=-1)
+        return self.down(torch.nn.functional.silu(b) * a)
 
 class Region(nn.Module):
     """Region with multi-timescale state and pose-aware heads."""
 
     def __init__(self, d_model: int, d_pose: int = 12, memory_cap: int = 128):
         super().__init__()
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.GELU(),
-            nn.Linear(4 * d_model, d_model)
-        )
+        self.norm = RMSNorm(d_model)
+        self.ff = SwiGLU(d_model, expansion=2)
         self.state = MultiTauState(d_model)
         self.pose_head = nn.Linear(d_model, d_pose)
         self.predictor = nn.Linear(d_model, d_model)
         self.kv = RegionMemoryKV(memory_cap, key_dim=d_model, val_dim=d_model)
+        self.unit_gate = KWTA(d_model, k=max(1, d_model // 8))
 
     def forward(self, x: torch.Tensor, neighbor_msg: torch.Tensor | None = None, alpha_boost: float = 1.0):
         """x: [B,D]; neighbor_msg: [B,D] or None"""
         if neighbor_msg is None:
             neighbor_msg = torch.zeros_like(x)
-        h = self.ff(x)
+        h = x + self.ff(self.norm(x))
+        with torch.no_grad():
+            mem = self.kv.read(h.mean(0))
+        h = h + 0.1 * mem
         s = self.state(h + neighbor_msg)
+        s = self.unit_gate(s)
         pose = self.pose_head(s)
         pred = self.predictor(s)
         aux = {'pose': pose.detach(), 'pred': pred.detach()}
+        with torch.no_grad():
+            self.kv.write(s.mean(0), s.mean(0))
         return h + s, aux
 
 
@@ -113,10 +144,21 @@ class CortexModel(nn.Module):
             s_aux_all.append(saux)
         H = torch.stack(H_list, dim=0)  # [R, B, D]
 
+        # Pre-gate surprise -> burst-based extra capacity
+        motor_idx = self.io_idxs['motor']
+        motor_pre = self.motor_proj(H[motor_idx])
+        if motor_pre.dim() == 3:
+            motor_pre = motor_pre.mean(dim=0)
+        if targets is not None:
+            _, _, S_pre, _, _ = self.surprise(motor_pre, targets)
+            burst_k = int(round(self.burster.burst_signal(S_pre) * max(1, self.R // 8)))
+        else:
+            burst_k = 0
+
         # 2) Ultra-sparse region gating (~2%) before routing
         Hs, reg_mask, adj_scores, gate_diag = self.gate(H,
                                                         neighbor_msg=self._neighbor_msg_prev,
-                                                        burst_extra_k=0,
+                                                        burst_extra_k=burst_k,
                                                         io_force_on=True)
 
         # 3) Sparse inter-region message passing among active regions
