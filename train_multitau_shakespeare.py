@@ -2,7 +2,6 @@ import os
 import math
 import torch
 
-from cortex.cortex_model import CortexModel
 from cortex.io_patches import TextSensor
 from cortex.hexgrid import make_grid, build_adjacency
 from torch.optim import Adam
@@ -69,6 +68,7 @@ R = len(hexes)
 io_idxs = {"sensor": 0, "motor": R - 1}
 print(f"Using {R} regions (grid {regions_w}x{regions_h}), d_model={d_model}")
 
+from cortex.cortex_model import CortexModel
 model = CortexModel(
     R=R,
     d_model=d_model,
